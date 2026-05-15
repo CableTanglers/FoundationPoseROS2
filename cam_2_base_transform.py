@@ -89,33 +89,15 @@ def T_inv(T_in):
     return numpy.vstack((numpy.hstack((R_out,t_out)),numpy.array([0, 0, 0, 1])))
 
 def transformation(pose):
-    p_OwrtC=Pose() 
-    p_OwrtC.position.x=float(pose[0])
-    p_OwrtC.position.y=float(pose[1])
-    p_OwrtC.position.z=float(pose[2])
-    p_OwrtC.orientation.w=float(pose[6])
-    p_OwrtC.orientation.x=float(pose[3])
-    p_OwrtC.orientation.y=float(pose[4])
-    p_OwrtC.orientation.z=float(pose[5])
-    Tco = Pose_2_mat(p_OwrtC)
-
-    p_CwrtB=Pose() 
-    p_CwrtB.position.x=-0.143361
-    p_CwrtB.position.y=-1.45842
-    p_CwrtB.position.z=0.375607
-    p_CwrtB.orientation.w=0.575573
-    p_CwrtB.orientation.x=-0.817741
-    p_CwrtB.orientation.y=-0.00388839
-    p_CwrtB.orientation.z=-0.000290818
-    Tbc = Pose_2_mat(p_CwrtB)
-
-    Tbo = numpy.matmul(Tbc, Tco)
-
-    rot_mat1 = Rot.from_matrix(Tbo[:3,:3])
-    quat1 = rot_mat1.as_quat()
-    rot_vec1 = rot_mat1.as_rotvec()
-    position1 = Tbo[:3,3]
-
-    pose= numpy.concatenate((position1, quat1))
-    object_pose_base = [pose[0], pose[1], pose[2], pose[6], pose[3], pose[4], pose[5]] #wxyz
-    return object_pose_base
+    # HUNK 4: stubbed to identity. Upstream hardcoded a static camera-to-base
+    # transform tuned for one specific RealSense rig (numbers preserved in git
+    # history). The AIC adapter does its own composition via
+    # tf2_ros.Buffer.lookup_transform + offset.json -- leaking another rig's
+    # geometry here would corrupt the cam-frame poses we publish.
+    # Returns the cam-frame pose untouched (wxyz quaternion order, matching
+    # the upstream return contract).
+    return [
+        float(pose[0]), float(pose[1]), float(pose[2]),  # position xyz
+        float(pose[6]),                                   # quaternion w
+        float(pose[3]), float(pose[4]), float(pose[5]),  # quaternion xyz
+    ]

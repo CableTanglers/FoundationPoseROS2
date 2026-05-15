@@ -1,0 +1,4 @@
+[submodule "FoundationPose"]
+	path = FoundationPose
+	url = git@github.com:CableTanglers/FoundationPose.git
+	branch = main

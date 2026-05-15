@@ -1,0 +1,11 @@
+
+
+# AIC additions: nested FoundationPose/ clone is staged as a
+# submodule entry pointing at CableTanglers/FoundationPose; the
+# checkout itself plus its weights/* (gdown'd at install time)
+# should not be tracked by this wrapper repo.
+FoundationPose/.git/
+FoundationPose/weights/
+FoundationPose/build/
+*.pyc
+__pycache__/
