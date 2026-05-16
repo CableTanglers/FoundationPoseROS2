@@ -119,7 +119,7 @@ def rearrange_files(file_paths):
 # HUNK 3: add --assign-strategy for deterministic mask-to-mesh assignment.
 parser = argparse.ArgumentParser()
 code_dir = os.path.dirname(os.path.realpath(__file__))
-parser.add_argument('--est_refine_iter', type=int, default=4)
+parser.add_argument('--est_refine_iter', type=int, default=5)  # was 4; matches isaacros_foundationpose_runner.py baseline
 parser.add_argument('--track_refine_iter', type=int, default=2)
 parser.add_argument(
     '--meshes', nargs='+', default=None,
@@ -354,7 +354,12 @@ class PoseEstimationNode(Node):
         H, W = self.color_image.shape[:2]
         color = cv2.resize(self.color_image, (W, H), interpolation=cv2.INTER_NEAREST)
         depth = cv2.resize(self.depth_image, (W, H), interpolation=cv2.INTER_NEAREST)
-        depth[(depth < 0.1) | (depth >= np.inf)] = 0
+        # HUNK 12 (Phase 1.G parity): the upstream daemon clamped
+        # depth<0.1m → 0 to mute the close-range gripper. The batch
+        # runner.py baseline that produced 87/90 NIC + 87/90 SC just
+        # zeros out non-finite depth — clamping creates a hole at the
+        # cable plug that perturbs FP.register's convergence.
+        depth[~np.isfinite(depth)] = 0.0
 
         # HUNK 9: in reset mode, tear down the per-frame pose_estimations and
         # re-bootstrap each frame. Do this BEFORE the bootstrap check so the
@@ -473,7 +478,16 @@ class PoseEstimationNode(Node):
                 # HUNK 9: in reset mode (or first frame in normal mode), also
                 # publish the register() result — we'd otherwise drop the
                 # bootstrap pose entirely in sparse-frame mode.
-                center_pose = pose @ np.linalg.inv(to_origin)
+                # HUNK 13 (Phase 1.G parity): drop the inv(to_origin)
+                # multiply. The batch runner.py (which produced the
+                # 87/90 NIC + 87/90 SC baselines) publishes pose
+                # directly from FP.register, NOT pose @ inv(to_origin).
+                # FP's register already returns the pose in the
+                # mesh-frame convention since `mesh=mesh` was passed
+                # at construction; the extra OBB-to-mesh transform
+                # double-centers and offsets the result by ~88mm on
+                # NIC (mesh centroid at 128mm Z).
+                center_pose = pose
                 self.publish_pose_stamped(
                     center_pose,
                     f"{self._frame_id_prefix}_{idx}",
