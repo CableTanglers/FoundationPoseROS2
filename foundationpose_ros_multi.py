@@ -201,6 +201,20 @@ class PoseEstimationNode(Node):
         self.bridge = CvBridge()
         self.depth_image = None
         self.color_image = None
+        # HUNK 11 (post-v4.2 Phase 1.F): external mask input. When the
+        # operator publishes per-mesh binary masks on
+        # `/aic_isaacros/mask_<cam>_<obj_id>`, the daemon SKIPS SAM2 +
+        # _assign_masks_to_meshes and uses the supplied mask directly.
+        # Falls back to SAM2+largest when no fresh mask is available.
+        # Required for the SC path because SAM2's "largest blob"
+        # heuristic picks the cable instead of the SC port at typical
+        # wrist-camera working distance.
+        self._external_masks: dict[int, tuple[int, np.ndarray]] = {}  # obj_id → (stamp_ns, mask)
+        # 30 s freshness window — matches register_per_frame=true budget
+        # where each frame can take ~18 s (rotation grid + register).
+        # The feeder always publishes mask + rgb with identical stamps,
+        # so any cached mask <30 s old is from a recent enough frame.
+        self._external_mask_max_age_ns = int(30.0 * 1e9)
         self.cam_K = None  # Initialize cam_K as None until we receive the camera info
 
         # HUNK 5: track the input RGB stamp so publish_pose_stamped can echo it.
@@ -233,6 +247,47 @@ class PoseEstimationNode(Node):
         # HUNK 3 + HUNK 9: bootstrap flag. True on first frame and every frame
         # in reset mode. Set to False after a successful pose_estimations build.
         self._needs_reregister = True
+
+        # HUNK 11: optional external mask subscriptions. The launch wires
+        # a topic per (cam, obj_id) based on pose_topic_prefix — we
+        # mirror the suffix scheme: pose_<cam>_<idx+1> ⇔
+        # mask_<cam>_<idx+1>. The mask is a binary mono8 Image; the
+        # most-recent message with stamp within
+        # ``_external_mask_max_age_ns`` is preferred over SAM2.
+        cam_from_pose_prefix = self._pose_topic_prefix.rsplit("_", 1)[-1]
+        mask_prefix = self._pose_topic_prefix.replace(
+            "/pose_", "/mask_", 1
+        )
+        for mesh_idx in range(len(self.meshes)):
+            obj_id = mesh_idx + 1
+            topic = f"{mask_prefix}_{obj_id}"
+            self.create_subscription(
+                Image, topic,
+                lambda m, o=obj_id: self._on_external_mask(m, o),
+                qos,
+            )
+            self.get_logger().info(
+                f"HUNK 11: subscribed external mask topic {topic} → obj_id={obj_id}"
+            )
+
+    def _on_external_mask(self, msg, obj_id: int):
+        """HUNK 11: cache the latest external mask for this obj_id."""
+        try:
+            mask = self.bridge.imgmsg_to_cv2(msg, desired_encoding="mono8")
+        except Exception as e:
+            self.get_logger().warn(
+                f"HUNK 11: external mask decode failed for obj_id={obj_id}: {e}"
+            )
+            return
+        stamp_ns = int(msg.header.stamp.sec) * 10**9 + int(msg.header.stamp.nanosec)
+        coverage = int((mask > 0).sum())
+        is_new = obj_id not in self._external_masks
+        self._external_masks[obj_id] = (stamp_ns, (mask > 0).astype(np.uint8) * 255)
+        if is_new:
+            self.get_logger().info(
+                f"HUNK 11: first external mask received for obj_id={obj_id} "
+                f"coverage={coverage}px stamp={stamp_ns}"
+            )
 
     def _synced_callback(self, img_msg, depth_msg, info_msg):
         """HUNK 8: single entry point for the synced (RGB, depth, info) triple.
@@ -311,30 +366,59 @@ class PoseEstimationNode(Node):
         # HUNK 3: bootstrap path replaced with a deterministic strategy.
         # Re-entered on every frame in reset mode (HUNK 9).
         if self._needs_reregister:
-            res = self.seg_model.predict(color, verbose=False)[0]
-            if not res or len(res) == 0:
-                self.get_logger().warn("HUNK 3: SAM2 produced no masks; retry next frame.")
-                return
+            # HUNK 11: prefer external masks when fresh. The mask topic
+            # is the operator-driven path that bypasses SAM2 + the
+            # ``largest`` heuristic — required for SC where SAM2 picks
+            # the cable plug instead of the port at wrist-camera
+            # working distance.
+            now_ns = int(self._last_rgb_stamp.sec) * 10**9 + int(self._last_rgb_stamp.nanosec) \
+                     if self._last_rgb_stamp is not None else 0
+            external_assigned: dict[int, dict] = {}
+            for mesh_idx in range(len(self.meshes)):
+                obj_id = mesh_idx + 1
+                cached = self._external_masks.get(obj_id)
+                if cached is None:
+                    continue
+                stamp_ns, mask = cached
+                if now_ns > 0 and abs(now_ns - stamp_ns) > self._external_mask_max_age_ns:
+                    continue
+                # Resize to match color image if shapes differ.
+                if mask.shape[:2] != (H, W):
+                    mask = cv2.resize(mask, (W, H), interpolation=cv2.INTER_NEAREST)
+                external_assigned[mesh_idx] = {'mask': mask, 'box': None, 'contour': None}
 
-            objects_to_track = []
-            for r in res:
-                for c in r:
-                    if c.masks is None or len(c.masks.xy) == 0:
-                        continue
-                    mask = np.zeros((H, W), np.uint8)
-                    contour = c.masks.xy[-1].astype(np.int32).reshape(-1, 1, 2)
-                    cv2.drawContours(mask, [contour], -1, (255, 255, 255), cv2.FILLED)
-                    objects_to_track.append({
-                        'mask': mask,
-                        'box': c.boxes.xyxy.tolist()[-1] if len(c.boxes.xyxy) else None,
-                        'contour': contour,
-                    })
+            if external_assigned:
+                # Skip SAM2 entirely; assignment is direct.
+                assigned = {i: external_assigned.get(i) for i in range(len(self.meshes))}
+                self.get_logger().info(
+                    f"HUNK 11: using external masks for "
+                    f"{sorted(external_assigned.keys())}"
+                )
+            else:
+                res = self.seg_model.predict(color, verbose=False)[0]
+                if not res or len(res) == 0:
+                    self.get_logger().warn("HUNK 3: SAM2 produced no masks; retry next frame.")
+                    return
 
-            if not objects_to_track:
-                self.get_logger().warn("HUNK 3: no usable mask candidates; retry next frame.")
-                return
+                objects_to_track = []
+                for r in res:
+                    for c in r:
+                        if c.masks is None or len(c.masks.xy) == 0:
+                            continue
+                        mask = np.zeros((H, W), np.uint8)
+                        contour = c.masks.xy[-1].astype(np.int32).reshape(-1, 1, 2)
+                        cv2.drawContours(mask, [contour], -1, (255, 255, 255), cv2.FILLED)
+                        objects_to_track.append({
+                            'mask': mask,
+                            'box': c.boxes.xyxy.tolist()[-1] if len(c.boxes.xyxy) else None,
+                            'contour': contour,
+                        })
 
-            assigned = self._assign_masks_to_meshes(objects_to_track, color)
+                if not objects_to_track:
+                    self.get_logger().warn("HUNK 3: no usable mask candidates; retry next frame.")
+                    return
+
+                assigned = self._assign_masks_to_meshes(objects_to_track, color)
             temporary_pose_estimations = {}
             for mesh_idx, obj in assigned.items():
                 if obj is None:
