@@ -9,3 +9,8 @@ FoundationPose/weights/
 FoundationPose/build/
 *.pyc
 __pycache__/
+
+# Bind-mount targets the docker container mounts in from
+# data/models/* — never tracked by this wrapper repo.
+sam2.1_b.pt
+sam2.1*.pt
