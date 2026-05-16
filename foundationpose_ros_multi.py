@@ -430,13 +430,21 @@ class PoseEstimationNode(Node):
                     continue
                 temp_mesh = self.meshes[mesh_idx]
                 temp_to_origin, _ = self.bounds[mesh_idx]
+                # HUNK 14 (Phase 1.G further parity):
+                #   - Cast pts/normals to float32 (batch baseline does;
+                #     trimesh defaults float64 which can perturb FP's
+                #     internal hypothesis ranking).
+                #   - glctx=None lets FP create its own context per
+                #     instance, matching the batch baseline.
+                #   - symmetry_tfs=None explicit (matches batch).
                 pose_est = FoundationPose(
-                    model_pts=temp_mesh.vertices,
-                    model_normals=temp_mesh.vertex_normals,
+                    model_pts=np.asarray(temp_mesh.vertices, dtype=np.float32),
+                    model_normals=np.asarray(temp_mesh.vertex_normals, dtype=np.float32),
+                    symmetry_tfs=None,
                     mesh=temp_mesh,
                     scorer=self.scorer,
                     refiner=self.refiner,
-                    glctx=self.glctx,
+                    glctx=None,
                 )
                 temporary_pose_estimations[mesh_idx] = {
                     'pose_est': pose_est,
