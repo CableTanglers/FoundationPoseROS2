@@ -471,7 +471,16 @@ class PoseEstimationNode(Node):
             to_origin = data['to_origin']
             if pose_est.is_register and not self._reset_each_frame:
                 pose = pose_est.track_one(rgb=color, depth=depth, K=self.cam_K, iteration=args.track_refine_iter)
-                center_pose = pose @ np.linalg.inv(to_origin)
+                # HUNK 15 (track_one parity with HUNK 13): drop the
+                # inv(to_origin) multiply here too. FP.register and
+                # FP.track_one both return poses in the same frame
+                # convention — mesh-native, since mesh=mesh was passed
+                # at construction. The OBB-to-mesh re-shift introduces
+                # the same ~88mm error that HUNK 13 fixed on register.
+                # Today masked by reset_each_frame=true (which never
+                # takes this branch), but Phase 4 tracker mode would
+                # exercise this path and resurrect the bug.
+                center_pose = pose
 
                 self.publish_pose_stamped(
                     center_pose,
