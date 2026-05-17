@@ -184,8 +184,16 @@ class PoseEstimationNode(Node):
         # trio. Slop = 0.05 s = the PRD's timestamp_tolerance_ms (50 ms).
         # NOTE: the previous bare `self.create_subscription` calls from upstream
         # are intentionally removed in favor of this single synced entry-point.
+        #
+        # HUNK 16: RELIABLE QoS. ros_gz_bridge publishes the AIC eval
+        # container's RGB / depth / camera_info topics with
+        # Reliability: RELIABLE (verified via `ros2 topic info -v`
+        # against my-eval:v1). BEST_EFFORT here silently fails the
+        # QoS-compatibility check under rmw_zenoh_cpp — the daemon
+        # shows matched publishers but never receives a frame. Same
+        # root cause hit the chain's depth_adapter + mask_publisher.
         qos = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
+            reliability=ReliabilityPolicy.RELIABLE,
             history=HistoryPolicy.KEEP_LAST,
             depth=qlen,
         )
