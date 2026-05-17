@@ -18,8 +18,16 @@
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction, ExecuteProcess
 from launch.substitutions import LaunchConfiguration
+import os
 
-CAMERAS = ('left', 'center', 'right')
+# Memory constraint on 20 GiB GPU: each FP node uses ~6-8 GiB; with Gazebo
+# rendering also competing for VRAM (~2-3 GiB), spawning all 3 OOMs during
+# refine_network.forward. AIC_FP_CAMERAS env var overrides; default to
+# center-only for smoke validation. Set AIC_FP_CAMERAS=left,center,right
+# in production once we have a 24+ GiB GPU OR reduce per-node footprint.
+CAMERAS = tuple(
+    cam for cam in os.environ.get('AIC_FP_CAMERAS', 'center').split(',') if cam
+)
 
 
 def _one_cam(cam, mesh_paths, strategy_arg, reset_arg, sim_time_arg):
@@ -48,7 +56,12 @@ def _one_cam(cam, mesh_paths, strategy_arg, reset_arg, sim_time_arg):
             '-p', f"depth_topic:=/aic_isaacros/depth_{cam}",
             '-p', f"camera_info_topic:=/{cam}_camera/camera_info",
             '-p', f"pose_topic_prefix:=/aic_isaacros/pose_{cam}",
-            '-p', f"frame_id_prefix:=wrist_{cam}_optical",
+            # AIC PATCH (2026-05-17): the AIC eval URDF publishes the
+            # wrist camera frames as `<cam>_camera/optical` (per
+            # basler_camera_macro). The prior `wrist_{cam}_optical` was
+            # from the upstream demo bag and doesn't exist in our TF tree.
+            # fp_daemon_server's TF lookup needs this to match.
+            '-p', f"frame_id_prefix:={cam}_camera/optical",
             '-p', 'sync_slop_s:=0.05',
             '-p', ['reset_each_frame:=', reset_arg],
         ],

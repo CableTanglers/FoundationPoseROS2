@@ -2,8 +2,14 @@
 
 PROJ_ROOT=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 
-# Install dependencies
-pip install torchvision==0.16.0+cu121 torchaudio==2.1.0 torch==2.1.0+cu121 --index-url https://download.pytorch.org/whl/cu121
+# Install dependencies.
+# AIC PATCH (2026-05-17 kilted rebuild): bumped from torch 2.1.0+cu121
+# (Py3.10 wheels) to torch 2.4.1+cu124 (Py3.12 wheels). Reason: kilted
+# base image is Ubuntu 24.04 + system Py3.12; conda env must match for
+# rclpy ABI. FoundationPose README L1 explicitly says "cu124 works on
+# most recent NVIDIA GPUs", and CUDA is minor-version forward-compatible
+# so 12.6 host nvcc + cu124 runtime wheels work fine.
+pip install torchvision==0.19.1+cu124 torchaudio==2.4.1+cu124 torch==2.4.1+cu124 --index-url https://download.pytorch.org/whl/cu124
 # AIC PATCH (HUNK 11 — build isolation guard): pytorch3d's setup.py imports
 # torch at build time. PEP 517 build isolation (pip 23+) creates a fresh
 # build env without torch, causing ModuleNotFoundError. --no-build-isolation

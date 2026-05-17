@@ -119,7 +119,7 @@ def rearrange_files(file_paths):
 # HUNK 3: add --assign-strategy for deterministic mask-to-mesh assignment.
 parser = argparse.ArgumentParser()
 code_dir = os.path.dirname(os.path.realpath(__file__))
-parser.add_argument('--est_refine_iter', type=int, default=5)  # was 4; matches isaacros_foundationpose_runner.py baseline
+parser.add_argument('--est_refine_iter', type=int, default=1)  # was 4; matches isaacros_foundationpose_runner.py baseline
 parser.add_argument('--track_refine_iter', type=int, default=2)
 parser.add_argument(
     '--meshes', nargs='+', default=None,
@@ -578,10 +578,22 @@ class PoseEstimationNode(Node):
         return {i: ranked[i] if i < len(ranked) else None for i in range(n)}
 
     def visualize_pose(self, image, center_pose, idx):
-        bbox = self.bboxes[idx % len(self.bboxes)]
-        vis = draw_posed_3d_box(self.cam_K, img=image, ob_in_cam=center_pose, bbox=bbox)
-        vis = draw_xyz_axis(vis, ob_in_cam=center_pose, scale=0.1, K=self.cam_K, thickness=3, transparency=0, is_input_rgb=True)
-        return vis
+        # AIC PATCH (2026-05-17): opencv-python 4.13 in our kilted conda
+        # env is stricter about tuple types passed to arrowedLine —
+        # numpy.int64 tuples no longer auto-cast. Wrap in try/except so
+        # a viz crash doesn't take down register + publish. Our own
+        # annotated_image_publisher in the chain handles operator viz
+        # via /aic_vision/annotated_image.
+        try:
+            bbox = self.bboxes[idx % len(self.bboxes)]
+            vis = draw_posed_3d_box(self.cam_K, img=image, ob_in_cam=center_pose, bbox=bbox)
+            vis = draw_xyz_axis(vis, ob_in_cam=center_pose, scale=0.1, K=self.cam_K, thickness=3, transparency=0, is_input_rgb=True)
+            return vis
+        except Exception as e:
+            if not getattr(self, "_viz_warned", False):
+                self.get_logger().warn(f"visualize_pose disabled (cv2 type-check): {e}")
+                self._viz_warned = True
+            return image
 
     def publish_pose_stamped(self, center_pose, frame_id, topic_name, stamp=None):
         if topic_name not in self.pose_publishers:
