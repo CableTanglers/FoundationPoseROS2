@@ -39,9 +39,14 @@ def _one_cam(cam, mesh_paths, strategy_arg, reset_arg, sim_time_arg):
             '--ros-args',
             '-r', f'__node:=foundationpose_{cam}',
             '-p', ['use_sim_time:=', sim_time_arg],
-            '-p', f"image_topic:=/wrist_{cam}/image_raw",
+            # Topic names default to the live AIC eval pipeline (aic_adapter
+            # publishes /<cam>_camera/image + /<cam>_camera/camera_info).
+            # Offline benchmark feeder uses /wrist_<cam>/image_raw + matching
+            # camera_info; that mode would need overrides via
+            # `ros2 launch ... image_topic:=...` or a parallel launch file.
+            '-p', f"image_topic:=/{cam}_camera/image",
             '-p', f"depth_topic:=/aic_isaacros/depth_{cam}",
-            '-p', f"camera_info_topic:=/wrist_{cam}/camera_info",
+            '-p', f"camera_info_topic:=/{cam}_camera/camera_info",
             '-p', f"pose_topic_prefix:=/aic_isaacros/pose_{cam}",
             '-p', f"frame_id_prefix:=wrist_{cam}_optical",
             '-p', 'sync_slop_s:=0.05',
