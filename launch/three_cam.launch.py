@@ -30,7 +30,8 @@ CAMERAS = tuple(
 )
 
 
-def _one_cam(cam, mesh_paths, strategy_arg, reset_arg, sim_time_arg):
+def _one_cam(cam, mesh_paths, strategy_arg, reset_arg, sim_time_arg,
+             pose_mode_arg, seed_topic_arg, seed_max_age_ms_arg):
     # We use ExecuteProcess instead of launch_ros.actions.Node because the
     # patched script is invoked as a plain python module, not a ros2 entry
     # point (the upstream repo ships no setup.py / package.xml). The CLI
@@ -64,6 +65,13 @@ def _one_cam(cam, mesh_paths, strategy_arg, reset_arg, sim_time_arg):
             '-p', f"frame_id_prefix:={cam}_camera/optical",
             '-p', 'sync_slop_s:=0.05',
             '-p', ['reset_each_frame:=', reset_arg],
+            # HUNK 17 (Agent R, 2026-05-18): seeded_track mode + seed
+            # topic wiring. Default 'register' preserves legacy
+            # behaviour. Live NIC chain uses 'seeded_track' to consume
+            # the nic_pose_daemon's broadcast prior.
+            '-p', ['pose_mode:=', pose_mode_arg],
+            '-p', ['seed_topic:=', seed_topic_arg],
+            '-p', ['seed_max_age_ms:=', seed_max_age_ms_arg],
         ],
         output='screen',
         name=f'foundationpose_{cam}',
@@ -101,10 +109,34 @@ def generate_launch_description():
             description='ROS use_sim_time — true for /clock-driven eval, '
                         'false for wall-stamp benchmark feeder.',
         ),
+        # HUNK 17 (Agent R, 2026-05-18): seeded_track wiring.
+        DeclareLaunchArgument(
+            'pose_mode',
+            default_value='register',
+            description="HUNK 17: 'register' (default — multimodal hypothesis "
+                        "search per frame), 'seeded_track' (refine from "
+                        "broadcast /aic_vision/coarse_pose_seed prior), or "
+                        "'track' (register on bootstrap, track_one after).",
+        ),
+        DeclareLaunchArgument(
+            'seed_topic',
+            default_value='/aic_vision/coarse_pose_seed',
+            description="HUNK 17: PoseStamped seed topic (T_cam_obj in "
+                        "<cam>_camera/optical) consumed in seeded_track mode.",
+        ),
+        DeclareLaunchArgument(
+            'seed_max_age_ms',
+            default_value='500.0',
+            description="HUNK 17: max age (ms) of seed vs current RGB stamp "
+                        "before falling back to register-mode.",
+        ),
     ]
     strategy_arg = LaunchConfiguration('assign_strategy')
     reset_arg    = LaunchConfiguration('reset_each_frame')
     sim_time_arg = LaunchConfiguration('use_sim_time')
+    pose_mode_arg       = LaunchConfiguration('pose_mode')
+    seed_topic_arg      = LaunchConfiguration('seed_topic')
+    seed_max_age_ms_arg = LaunchConfiguration('seed_max_age_ms')
 
     # Resolve meshes at launch time so we can split the
     # space-separated string into separate argv entries (--meshes uses
@@ -113,7 +145,8 @@ def generate_launch_description():
         meshes_str = LaunchConfiguration('meshes').perform(context)
         mesh_paths = meshes_str.split()
         return [
-            _one_cam(c, mesh_paths, strategy_arg, reset_arg, sim_time_arg)
+            _one_cam(c, mesh_paths, strategy_arg, reset_arg, sim_time_arg,
+                     pose_mode_arg, seed_topic_arg, seed_max_age_ms_arg)
             for c in CAMERAS
         ]
 

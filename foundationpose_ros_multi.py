@@ -4,7 +4,7 @@ sys.path.append('./FoundationPose/nvdiffrast')
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from estimater import *
 import cv2
 import numpy as np
@@ -15,6 +15,7 @@ from cv_bridge import CvBridge
 from message_filters import ApproximateTimeSynchronizer, Subscriber
 import argparse
 import os
+import threading
 from scipy.spatial.transform import Rotation as R
 from ultralytics import SAM
 from cam_2_base_transform import *
@@ -22,6 +23,17 @@ import os
 import tkinter as tk
 from tkinter import Listbox, END, Button
 import glob
+
+# HUNK 17 (Agent R, 2026-05-18): torch import for seeded_track mode. The
+# adapter must push a 4x4 prior into pose_est.pose_last as a CUDA tensor
+# before calling track_one(). Defer the import — if torch isn't on the
+# Python path (e.g. headless smoke tests), the node still constructs and
+# falls back to register-mode.
+try:
+    import torch as _torch  # noqa: F401
+    _HAVE_TORCH = True
+except Exception:
+    _HAVE_TORCH = False
 
 # Save the original `__init__` and `register` methods
 original_init = FoundationPose.__init__
@@ -164,6 +176,19 @@ class PoseEstimationNode(Node):
         # where successive frames may be wider than the tracker convergence basin.
         self.declare_parameter('reset_each_frame', False)
 
+        # HUNK 17 (Agent R, 2026-05-18): seeded_track mode. When pose_mode is
+        # 'seeded_track' AND a recent PoseStamped seed is available on
+        # ``seed_topic`` whose ``header.frame_id`` matches this node's
+        # ``frame_id_prefix``, the daemon skips register()'s multimodal
+        # hypothesis search and runs FP.track_one() refined from the seed
+        # prior — i.e. the offline Phase 3b 3.88mm pattern, but live. Falls
+        # back to register-mode when no fresh seed exists (cold start).
+        # Default 'register' preserves legacy behavior for callers that
+        # haven't wired the seed topic.
+        self.declare_parameter('pose_mode', 'register')
+        self.declare_parameter('seed_topic', '/aic_vision/coarse_pose_seed')
+        self.declare_parameter('seed_max_age_ms', 500.0)
+
         image_topic = self.get_parameter('image_topic').value
         depth_topic = self.get_parameter('depth_topic').value
         info_topic  = self.get_parameter('camera_info_topic').value
@@ -171,13 +196,24 @@ class PoseEstimationNode(Node):
         self._frame_id_prefix   = self.get_parameter('frame_id_prefix').value
         self._assign_strategy   = self.get_parameter('assign_strategy').value
         self._reset_each_frame  = bool(self.get_parameter('reset_each_frame').value)
+        self._pose_mode         = str(self.get_parameter('pose_mode').value).strip().lower()
+        self._seed_topic        = str(self.get_parameter('seed_topic').value)
+        self._seed_max_age_ns   = int(float(self.get_parameter('seed_max_age_ms').value) * 1e6)
         slop = float(self.get_parameter('sync_slop_s').value)
         qlen = int(self.get_parameter('sync_queue').value)
+
+        if self._pose_mode not in ('register', 'seeded_track', 'track'):
+            self.get_logger().warn(
+                f"HUNK 17: unknown pose_mode='{self._pose_mode}'; falling back to 'register'"
+            )
+            self._pose_mode = 'register'
 
         self.get_logger().info(
             f"FoundationPoseROS2 [PATCHED]: rgb='{image_topic}' depth='{depth_topic}' "
             f"info='{info_topic}' strat='{self._assign_strategy}' "
-            f"reset_each_frame={self._reset_each_frame}"
+            f"reset_each_frame={self._reset_each_frame} "
+            f"pose_mode='{self._pose_mode}' seed_topic='{self._seed_topic}' "
+            f"seed_max_age_ms={self._seed_max_age_ns/1e6:.0f}"
         )
 
         # HUNK 8: ApproximateTimeSynchronizer for the (RGB, depth, camera_info)
@@ -277,6 +313,93 @@ class PoseEstimationNode(Node):
             self.get_logger().info(
                 f"HUNK 11: subscribed external mask topic {topic} → obj_id={obj_id}"
             )
+
+        # HUNK 17 (Agent R, 2026-05-18): per-frame coarse-pose seed.
+        # PoseStamped with frame_id == "<cam>_camera/optical"; we only
+        # honour seeds whose frame_id matches this node's frame_id_prefix
+        # (so left/center/right FP nodes can co-exist when each subscribes
+        # to the broadcast seed topic). Seed QoS mirrors Agent Q's
+        # publisher (RELIABLE + TRANSIENT_LOCAL — latched).
+        self._latest_seed_T_cam_obj: dict[int, tuple[int, np.ndarray]] = {}
+        self._seed_lock = threading.Lock()
+        if self._pose_mode == 'seeded_track':
+            seed_qos = QoSProfile(
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                history=HistoryPolicy.KEEP_LAST,
+                depth=5,
+            )
+            self.create_subscription(
+                PoseStamped, self._seed_topic,
+                self._on_pose_seed, seed_qos,
+            )
+            self.get_logger().info(
+                f"HUNK 17: subscribed seed topic {self._seed_topic} "
+                f"(only frame_id starting with '{self._frame_id_prefix}' accepted)"
+            )
+
+    def _on_pose_seed(self, msg):
+        """HUNK 17 (Agent R): cache the latest coarse-pose seed for this
+        camera. The seed is published in ``<seed_cam>_camera/optical`` by
+        the NIC pose daemon; only seeds whose ``header.frame_id`` matches
+        this node's ``frame_id_prefix`` are accepted. obj_id is inferred
+        from the topic suffix scheme: the daemon broadcasts a single
+        per-object seed today (NIC = obj_id 1), so we route it through
+        the single mesh slot we know about.
+        """
+        if not msg.header.frame_id.startswith(self._frame_id_prefix):
+            return
+        # Decode 4x4 T_cam_obj from PoseStamped (metres).
+        px = float(msg.pose.position.x)
+        py = float(msg.pose.position.y)
+        pz = float(msg.pose.position.z)
+        qx = float(msg.pose.orientation.x)
+        qy = float(msg.pose.orientation.y)
+        qz = float(msg.pose.orientation.z)
+        qw = float(msg.pose.orientation.w)
+        try:
+            Rm = R.from_quat([qx, qy, qz, qw]).as_matrix()
+        except Exception:
+            return
+        T = np.eye(4, dtype=np.float32)
+        T[:3, :3] = Rm.astype(np.float32)
+        T[:3, 3] = (px, py, pz)
+        stamp_ns = int(msg.header.stamp.sec) * 10**9 + int(msg.header.stamp.nanosec)
+        # The seed is currently emitted only for NIC obj_id=1; if/when the
+        # daemon emits per-obj seeds, encode the obj_id in the topic suffix.
+        target_obj = 1
+        with self._seed_lock:
+            self._latest_seed_T_cam_obj[target_obj] = (stamp_ns, T)
+        if not getattr(self, "_seed_first_logged", False):
+            self.get_logger().info(
+                f"HUNK 17: first seed received frame_id='{msg.header.frame_id}' "
+                f"t_cam_obj=({px:.3f}, {py:.3f}, {pz:.3f}) stamp_ns={stamp_ns}"
+            )
+            self._seed_first_logged = True
+
+    def _fresh_seed_T_cam_obj(self, obj_id: int):
+        """Return (T_cam_obj, age_ns) for the latest seed of obj_id,
+        or None if no seed is fresh (or none has ever arrived).
+
+        HUNK 17 (Agent R, 2026-05-18): age is measured vs the node's
+        rclpy clock at the moment of the lookup — i.e. the SAME clock
+        the publisher (nic_pose_daemon) used when it stamped the seed
+        via ``self.get_clock().now().to_msg()``. Comparing against the
+        RGB image's header stamp instead breaks under bag-replay where
+        the bag stamps are bag-recording time but the seed is published
+        with the current ROS clock.
+        """
+        with self._seed_lock:
+            entry = self._latest_seed_T_cam_obj.get(obj_id)
+        if entry is None:
+            return None
+        stamp_ns, T = entry
+        now_t = self.get_clock().now()
+        now_ns = int(now_t.nanoseconds)
+        age = abs(now_ns - stamp_ns)
+        if age > self._seed_max_age_ns:
+            return None
+        return T, age
 
     def _on_external_mask(self, msg, obj_id: int):
         """HUNK 11: cache the latest external mask for this obj_id."""
@@ -477,6 +600,42 @@ class PoseEstimationNode(Node):
             pose_est = data['pose_est']
             obj_mask = data['mask']
             to_origin = data['to_origin']
+            obj_id_local = idx + 1
+            # HUNK 17 (Agent R, 2026-05-18): seeded_track branch. If a
+            # fresh per-frame seed is available, skip register()'s
+            # multimodal hypothesis search and refine via track_one()
+            # from the seed. Matches the offline Phase 3b seeded_track
+            # pattern that reaches 3.88mm. Falls through to register
+            # when no fresh seed is in cache.
+            seeded = None
+            if self._pose_mode == 'seeded_track' and _HAVE_TORCH:
+                seeded = self._fresh_seed_T_cam_obj(obj_id_local)
+            if seeded is not None:
+                seed_T, seed_age_ns = seeded
+                pose_est.pose_last = _torch.as_tensor(
+                    seed_T, device="cuda", dtype=_torch.float,
+                )
+                pose = pose_est.track_one(
+                    rgb=color, depth=depth, K=self.cam_K,
+                    iteration=args.track_refine_iter,
+                )
+                pose_est.is_register = True
+                center_pose = pose
+                if not getattr(self, "_seeded_pub_logged", False):
+                    self.get_logger().info(
+                        f"HUNK 17: seeded_track first pose published "
+                        f"obj_id={obj_id_local} seed_age_ms={seed_age_ns/1e6:.1f}"
+                    )
+                    self._seeded_pub_logged = True
+                self.publish_pose_stamped(
+                    center_pose,
+                    f"{self._frame_id_prefix}_{idx}",
+                    f"{self._pose_topic_prefix}_{idx+1}",
+                    stamp=self._last_rgb_stamp,
+                )
+                visualization_image = self.visualize_pose(visualization_image, center_pose, idx)
+                self.i += 1
+                continue
             if pose_est.is_register and not self._reset_each_frame:
                 pose = pose_est.track_one(rgb=color, depth=depth, K=self.cam_K, iteration=args.track_refine_iter)
                 # HUNK 15 (track_one parity with HUNK 13): drop the
@@ -526,8 +685,16 @@ class PoseEstimationNode(Node):
         # self.i). Frame-bounded operations use this counter.
         self._frame_count += 1
 
-        cv2.imshow('Pose Estimation & Tracking', visualization_image[..., ::-1])
-        cv2.waitKey(1)
+        # Headless-safe: skip cv2.imshow when no display is available. The
+        # conda-vendored OpenCV has only the xcb Qt plugin (no offscreen),
+        # so attempting imshow without a display crashes the process with
+        # `qt.qpa.plugin: Could not find the Qt platform plugin "offscreen"`.
+        # The visualization is human-debug only; the pose pub above is the
+        # functional output.
+        # (Surfaced & patched by Agent P, 2026-05-18, during NIC live-chain validation.)
+        if os.environ.get("DISPLAY"):
+            cv2.imshow('Pose Estimation & Tracking', visualization_image[..., ::-1])
+            cv2.waitKey(1)
 
     # HUNK 3: assignment helpers — methods on PoseEstimationNode (NOT module
     # globals). Each returns {mesh_idx: candidate or None}.
