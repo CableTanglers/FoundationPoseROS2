@@ -132,7 +132,15 @@ def rearrange_files(file_paths):
 parser = argparse.ArgumentParser()
 code_dir = os.path.dirname(os.path.realpath(__file__))
 parser.add_argument('--est_refine_iter', type=int, default=1)  # was 4; matches isaacros_foundationpose_runner.py baseline
-parser.add_argument('--track_refine_iter', type=int, default=2)
+# HUNK 19 (Agent W diagnosis, 2026-05-18): bumped track_refine_iter
+# default 2 -> 5. After HUNK 17 turned on seeded_track + HUNK 18 fixed
+# the link->centered pose_last convention, the residual ~25 mm bias was
+# diagnosed as 2 iters being too few — refiner only closes "a few mm"
+# per pass; the cold seed sits 20-30 mm off in the centered-mesh basin
+# at each live frame (TF jitter + wrist motion between seed publish and
+# image capture). 5 iters closes it. Per-frame FP cost rises ~6 s ->
+# ~7-8 s; still fits the 120 s collect budget at frames_per_cam=10.
+parser.add_argument('--track_refine_iter', type=int, default=5)
 parser.add_argument(
     '--meshes', nargs='+', default=None,
     help='HUNK 2: explicit mesh paths in display/assignment order. '
