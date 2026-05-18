@@ -132,15 +132,18 @@ def rearrange_files(file_paths):
 parser = argparse.ArgumentParser()
 code_dir = os.path.dirname(os.path.realpath(__file__))
 parser.add_argument('--est_refine_iter', type=int, default=1)  # was 4; matches isaacros_foundationpose_runner.py baseline
-# HUNK 19 (Agent W diagnosis, 2026-05-18): bumped track_refine_iter
-# default 2 -> 5. After HUNK 17 turned on seeded_track + HUNK 18 fixed
-# the link->centered pose_last convention, the residual ~25 mm bias was
-# diagnosed as 2 iters being too few — refiner only closes "a few mm"
-# per pass; the cold seed sits 20-30 mm off in the centered-mesh basin
-# at each live frame (TF jitter + wrist motion between seed publish and
-# image capture). 5 iters closes it. Per-frame FP cost rises ~6 s ->
-# ~7-8 s; still fits the 120 s collect budget at frames_per_cam=10.
-parser.add_argument('--track_refine_iter', type=int, default=5)
+# HUNK 19 (Agent W diagnosis, 2026-05-18): tried bumping
+# track_refine_iter default 2 -> 5 to close a ~25 mm seeded_track
+# residual. Empirically MADE IT WORSE — 25 mm -> 52 mm with a TIGHTER
+# cluster. Hypothesis: 5 iters lets the refiner converge confidently
+# onto the SAM mask, but the SAM mask itself is mis-aligned vs the
+# image timestamp (wrist moves ~7.5 cm in the ~250 ms between seed
+# publish and FP processing), so converging harder onto a wrong-pose
+# mask produces a worse latched pose. Reverted to default=2. Real fix
+# is to (a) align seed/mask to image timestamp, OR (b) skip the seed
+# entirely via pose_mode=register (cold-start each frame). See
+# AIC_FP_POSE_MODE=register in start_fp_daemon_chain_legal.sh.
+parser.add_argument('--track_refine_iter', type=int, default=2)
 parser.add_argument(
     '--meshes', nargs='+', default=None,
     help='HUNK 2: explicit mesh paths in display/assignment order. '
