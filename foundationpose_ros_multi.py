@@ -612,9 +612,25 @@ class PoseEstimationNode(Node):
                 seeded = self._fresh_seed_T_cam_obj(obj_id_local)
             if seeded is not None:
                 seed_T, seed_age_ns = seeded
-                pose_est.pose_last = _torch.as_tensor(
-                    seed_T, device="cuda", dtype=_torch.float,
-                )
+                # HUNK 18 (Agent S, 2026-05-18): convert seed_T from the
+                # link-anchored T_cam_obj that Agent Q's daemon publishes
+                # into the AABB-centered frame that FoundationPose's
+                # `pose_last` lives in internally. FP.reset_object recenters
+                # the mesh by model_center=(min+max)/2 (estimater.py:44-51)
+                # and stores poses in centered coords; register/track_one
+                # OUTPUTS get converted back via `@ get_tf_to_centered_mesh()`
+                # (estimater.py:233,268) on the way out, but the INPUT
+                # pose_last must already be centered. Without this inverse
+                # conversion, the seed is offset by model_center → ~80mm Z
+                # bias on NIC (model_center=(-7.95,-12.50,+86.50)mm). HUNK
+                # 17 missed this on the way in; the refiner can only close
+                # a few mm per iter so track_refine_iter=2 left ~75mm
+                # residual.
+                seed_T_t = _torch.as_tensor(seed_T, device="cuda", dtype=_torch.float)
+                tf_centered_to_link = pose_est.get_tf_to_centered_mesh()
+                # right-multiplying by inv() converts a link-frame pose into
+                # the centered-mesh frame that FP expects in pose_last.
+                pose_est.pose_last = seed_T_t @ _torch.linalg.inv(tf_centered_to_link)
                 pose = pose_est.track_one(
                     rgb=color, depth=depth, K=self.cam_K,
                     iteration=args.track_refine_iter,
