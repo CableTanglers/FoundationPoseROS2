@@ -29,6 +29,19 @@ CAMERAS = tuple(
     cam for cam in os.environ.get('AIC_FP_CAMERAS', 'center').split(',') if cam
 )
 
+# Agent CC (2026-05-18): per-cam CUDA device pinning. Each FP node
+# uses ~13 GiB on an A4500 (with est_refine_iter=1 + reset_each_frame
+# + kornia.warp_perspective transient) so 2 nodes do not fit on one
+# 20 GiB GPU. AIC_FP_CUDA_VISIBLE_<CAM> lets the chain script pin
+# each FP process to a different physical GPU. If unset, the FP
+# container's compose-level CUDA_VISIBLE_DEVICES is inherited (legacy
+# single-cam flow). The docker container must expose BOTH host GPUs
+# (CUDA_VISIBLE_DEVICES=0,1 inside container) for this to take effect.
+_PER_CAM_CUDA_ENV = {
+    cam: os.environ.get(f'AIC_FP_CUDA_VISIBLE_{cam.upper()}', '')
+    for cam in CAMERAS
+}
+
 
 def _one_cam(cam, mesh_paths, strategy_arg, reset_arg, sim_time_arg,
              pose_mode_arg, seed_topic_arg, seed_max_age_ms_arg,
@@ -42,6 +55,16 @@ def _one_cam(cam, mesh_paths, strategy_arg, reset_arg, sim_time_arg,
     # in the same self._assign_strategy field at __init__ time.
     # mesh_paths is the already-split list[str] of mesh files; --meshes
     # expects nargs='+' so we splat it into the cmd array.
+    # Agent CC (2026-05-18): per-cam CUDA pinning. Only override the
+    # container's default CUDA_VISIBLE_DEVICES when the caller provided
+    # one — otherwise let docker-compose's CUDA_VISIBLE_DEVICES rule.
+    # Used on 2-GPU hardware to spread FP across host GPUs for multi-cam.
+    additional_env = {}
+    pinned_gpu = _PER_CAM_CUDA_ENV.get(cam, '')
+    if pinned_gpu:
+        additional_env['CUDA_VISIBLE_DEVICES'] = pinned_gpu
+        print(f'[three_cam.launch] pinning {cam} → CUDA_VISIBLE_DEVICES={pinned_gpu}')
+
     return ExecuteProcess(
         cmd=[
             'python3', '-u', 'foundationpose_ros_multi.py',
@@ -93,6 +116,7 @@ def _one_cam(cam, mesh_paths, strategy_arg, reset_arg, sim_time_arg,
         ],
         output='screen',
         name=f'foundationpose_{cam}',
+        additional_env=additional_env,
     )
 
 
