@@ -16,6 +16,7 @@ from message_filters import ApproximateTimeSynchronizer, Subscriber
 import argparse
 import os
 import threading
+import time
 from scipy.spatial.transform import Rotation as R
 from ultralytics import SAM
 from cam_2_base_transform import *
@@ -429,7 +430,7 @@ class PoseEstimationNode(Node):
         # (so left/center/right FP nodes can co-exist when each subscribes
         # to the broadcast seed topic). Seed QoS mirrors Agent Q's
         # publisher (RELIABLE + TRANSIENT_LOCAL — latched).
-        self._latest_seed_T_cam_obj: dict[int, tuple[int, np.ndarray]] = {}
+        self._latest_seed_T_cam_obj: dict[int, tuple[int, np.ndarray, int]] = {}
         self._seed_lock = threading.Lock()
         if self._pose_mode == 'seeded_track':
             seed_qos = QoSProfile(
@@ -474,11 +475,12 @@ class PoseEstimationNode(Node):
         T[:3, :3] = Rm.astype(np.float32)
         T[:3, 3] = (px, py, pz)
         stamp_ns = int(msg.header.stamp.sec) * 10**9 + int(msg.header.stamp.nanosec)
+        receipt_ns = time.monotonic_ns()
         # The seed is currently emitted only for NIC obj_id=1; if/when the
         # daemon emits per-obj seeds, encode the obj_id in the topic suffix.
         target_obj = 1
         with self._seed_lock:
-            self._latest_seed_T_cam_obj[target_obj] = (stamp_ns, T)
+            self._latest_seed_T_cam_obj[target_obj] = (stamp_ns, T, receipt_ns)
         if not getattr(self, "_seed_first_logged", False):
             self.get_logger().info(
                 f"HUNK 17: first seed received frame_id='{msg.header.frame_id}' "
@@ -490,22 +492,17 @@ class PoseEstimationNode(Node):
         """Return (T_cam_obj, age_ns) for the latest seed of obj_id,
         or None if no seed is fresh (or none has ever arrived).
 
-        HUNK 17 (Agent R, 2026-05-18): age is measured vs the node's
-        rclpy clock at the moment of the lookup — i.e. the SAME clock
-        the publisher (nic_pose_daemon) used when it stamped the seed
-        via ``self.get_clock().now().to_msg()``. Comparing against the
-        RGB image's header stamp instead breaks under bag-replay where
-        the bag stamps are bag-recording time but the seed is published
-        with the current ROS clock.
+        HUNK 17 follow-up (2026-05-19): age is measured from local receipt
+        time, not the ROS stamp. In bag replay FP runs with use_sim_time=true
+        while nic_pose_daemon emits wall-stamped seeds, so comparing ROS clock
+        domains rejects valid live seeds as stale.
         """
         with self._seed_lock:
             entry = self._latest_seed_T_cam_obj.get(obj_id)
         if entry is None:
             return None
-        stamp_ns, T = entry
-        now_t = self.get_clock().now()
-        now_ns = int(now_t.nanoseconds)
-        age = abs(now_ns - stamp_ns)
+        stamp_ns, T, receipt_ns = entry
+        age = time.monotonic_ns() - receipt_ns
         if age > self._seed_max_age_ns:
             return None
         return T, age
