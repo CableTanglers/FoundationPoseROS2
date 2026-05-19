@@ -31,7 +31,9 @@ CAMERAS = tuple(
 
 
 def _one_cam(cam, mesh_paths, strategy_arg, reset_arg, sim_time_arg,
-             pose_mode_arg, seed_topic_arg, seed_max_age_ms_arg):
+             pose_mode_arg, seed_topic_arg, seed_max_age_ms_arg,
+             mask_in_sync_arg, mask_sync_slop_s_arg,
+             external_mask_max_age_ms_arg):
     # We use ExecuteProcess instead of launch_ros.actions.Node because the
     # patched script is invoked as a plain python module, not a ros2 entry
     # point (the upstream repo ships no setup.py / package.xml). The CLI
@@ -64,6 +66,13 @@ def _one_cam(cam, mesh_paths, strategy_arg, reset_arg, sim_time_arg,
             # fp_daemon_server's TF lookup needs this to match.
             '-p', f"frame_id_prefix:={cam}_camera/optical",
             '-p', 'sync_slop_s:=0.05',
+            # HUNK 20 (Agent Z, 2026-05-18): bump sync_queue from default 10
+            # to 100 so the synchronizer can absorb the FoundationStereo
+            # depth adapter's ~3s/frame inference latency without evicting
+            # in-flight RGB frames. With queue=10 and ~14 fps RGB, RGB
+            # frames are evicted within ~0.7s — well before depth catches
+            # up. queue=100 lets depth take 7s to land and still match.
+            '-p', 'sync_queue:=100',
             '-p', ['reset_each_frame:=', reset_arg],
             # HUNK 17 (Agent R, 2026-05-18): seeded_track mode + seed
             # topic wiring. Default 'register' preserves legacy
@@ -72,6 +81,15 @@ def _one_cam(cam, mesh_paths, strategy_arg, reset_arg, sim_time_arg,
             '-p', ['pose_mode:=', pose_mode_arg],
             '-p', ['seed_topic:=', seed_topic_arg],
             '-p', ['seed_max_age_ms:=', seed_max_age_ms_arg],
+            # HUNK 20 (Agent Z, 2026-05-18): mask-in-sync wiring.
+            # When mask_in_sync=true AND argv has exactly one mesh,
+            # the daemon adds the mask topic as a 4th leg of the
+            # ApproximateTimeSynchronizer (tight 100ms slop). For the
+            # multi-mesh case the param silently degrades to the
+            # legacy cached path (controlled by external_mask_max_age_ms).
+            '-p', ['mask_in_sync:=', mask_in_sync_arg],
+            '-p', ['mask_sync_slop_s:=', mask_sync_slop_s_arg],
+            '-p', ['external_mask_max_age_ms:=', external_mask_max_age_ms_arg],
         ],
         output='screen',
         name=f'foundationpose_{cam}',
@@ -130,6 +148,31 @@ def generate_launch_description():
             description="HUNK 17: max age (ms) of seed vs current RGB stamp "
                         "before falling back to register-mode.",
         ),
+        # HUNK 20 (Agent Z, 2026-05-18): mask-in-sync wiring.
+        DeclareLaunchArgument(
+            'mask_in_sync',
+            default_value='true',
+            description="HUNK 20: include external mask topic as the 4th leg "
+                        "of ApproximateTimeSynchronizer. Only takes effect "
+                        "when exactly one mesh is passed (single-obj setup). "
+                        "Multi-mesh launches silently fall back to the legacy "
+                        "cached path.",
+        ),
+        DeclareLaunchArgument(
+            'mask_sync_slop_s',
+            default_value='0.1',
+            description="HUNK 20: ApproximateTimeSynchronizer slop (seconds) "
+                        "for the 4-leg (RGB, depth, info, mask) sync — must "
+                        "be tight so SAM lag relative to RGB does not bias "
+                        "the pose.",
+        ),
+        DeclareLaunchArgument(
+            'external_mask_max_age_ms',
+            default_value='200.0',
+            description="HUNK 20: max age (ms) of a cached external mask in "
+                        "the LEGACY non-synced path. Was 30000 (30s) historically; "
+                        "200ms matches live-chain SAM latency expectation.",
+        ),
     ]
     strategy_arg = LaunchConfiguration('assign_strategy')
     reset_arg    = LaunchConfiguration('reset_each_frame')
@@ -137,6 +180,9 @@ def generate_launch_description():
     pose_mode_arg       = LaunchConfiguration('pose_mode')
     seed_topic_arg      = LaunchConfiguration('seed_topic')
     seed_max_age_ms_arg = LaunchConfiguration('seed_max_age_ms')
+    mask_in_sync_arg               = LaunchConfiguration('mask_in_sync')
+    mask_sync_slop_s_arg           = LaunchConfiguration('mask_sync_slop_s')
+    external_mask_max_age_ms_arg   = LaunchConfiguration('external_mask_max_age_ms')
 
     # Resolve meshes at launch time so we can split the
     # space-separated string into separate argv entries (--meshes uses
@@ -146,7 +192,9 @@ def generate_launch_description():
         mesh_paths = meshes_str.split()
         return [
             _one_cam(c, mesh_paths, strategy_arg, reset_arg, sim_time_arg,
-                     pose_mode_arg, seed_topic_arg, seed_max_age_ms_arg)
+                     pose_mode_arg, seed_topic_arg, seed_max_age_ms_arg,
+                     mask_in_sync_arg, mask_sync_slop_s_arg,
+                     external_mask_max_age_ms_arg)
             for c in CAMERAS
         ]
 

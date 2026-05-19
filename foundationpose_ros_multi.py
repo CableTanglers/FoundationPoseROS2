@@ -200,6 +200,33 @@ class PoseEstimationNode(Node):
         self.declare_parameter('seed_topic', '/aic_vision/coarse_pose_seed')
         self.declare_parameter('seed_max_age_ms', 500.0)
 
+        # HUNK 20 (Agent Z, 2026-05-18): mask-in-sync mode. When enabled and
+        # the daemon is configured for a single mesh (single obj_id), the
+        # external mask topic is added as a 4th leg of the
+        # ApproximateTimeSynchronizer alongside (RGB, depth, camera_info).
+        # This guarantees the mask processed for a given RGB frame was
+        # produced from an RGB image with a stamp within ``sync_slop_s``
+        # of the current frame — closing the SAM-vs-RGB temporal mismatch
+        # that drove the 28mm TE in the live NIC chain (SAM at ~3.7s/frame
+        # was lagging RGB, and FP was pulling stale cached masks via the
+        # legacy 30s ``_external_mask_max_age_ns`` window).
+        #
+        # ``mask_topic`` is the explicit topic name; when empty (default)
+        # we derive it from ``pose_topic_prefix`` the same way the legacy
+        # cached-mask path does (s/pose_/mask_/ + ``_{obj_id}`` suffix).
+        # For the multi-mesh case we fall back to the legacy cached path
+        # (mask_in_sync silently disables).
+        self.declare_parameter('mask_in_sync', True)
+        self.declare_parameter('mask_topic', '')
+        self.declare_parameter('mask_sync_slop_s', 0.1)
+        # Tighter fallback for the legacy cached path (only relevant when
+        # mask_in_sync is False or disabled by multi-mesh): 200ms cap so
+        # we skip frames where SAM lagged RGB rather than running FP on a
+        # stale mask. Was 30s historically (matched register-per-frame
+        # mode's ~18s budget); the new 200ms is tied to live-chain SAM
+        # latency.
+        self.declare_parameter('external_mask_max_age_ms', 200.0)
+
         image_topic = self.get_parameter('image_topic').value
         depth_topic = self.get_parameter('depth_topic').value
         info_topic  = self.get_parameter('camera_info_topic').value
@@ -212,6 +239,9 @@ class PoseEstimationNode(Node):
         self._seed_max_age_ns   = int(float(self.get_parameter('seed_max_age_ms').value) * 1e6)
         slop = float(self.get_parameter('sync_slop_s').value)
         qlen = int(self.get_parameter('sync_queue').value)
+        self._mask_in_sync_param = bool(self.get_parameter('mask_in_sync').value)
+        mask_topic_param         = str(self.get_parameter('mask_topic').value).strip()
+        mask_sync_slop           = float(self.get_parameter('mask_sync_slop_s').value)
 
         if self._pose_mode not in ('register', 'seeded_track', 'track'):
             self.get_logger().warn(
@@ -247,11 +277,15 @@ class PoseEstimationNode(Node):
         self.image_mf = Subscriber(self, Image, image_topic, qos_profile=qos)
         self.depth_mf = Subscriber(self, Image, depth_topic, qos_profile=qos)
         self.info_mf  = Subscriber(self, CameraInfo, info_topic, qos_profile=qos)
-        self._sync = ApproximateTimeSynchronizer(
-            [self.image_mf, self.depth_mf, self.info_mf],
-            queue_size=qlen, slop=slop,
-        )
-        self._sync.registerCallback(self._synced_callback)
+        # HUNK 20 (Agent Z): defer the synchronizer construction until we
+        # know how many meshes were passed (mask_in_sync only kicks in
+        # for the single-mesh case). The 4-leg synchronizer is built
+        # below, after ``self.meshes`` is populated.
+        self._sync_qlen = qlen
+        self._sync_slop = slop
+        self._mask_sync_slop = mask_sync_slop
+        self._mask_topic_param = mask_topic_param
+        self._sync_qos = qos
 
         self.bridge = CvBridge()
         self.depth_image = None
@@ -265,11 +299,19 @@ class PoseEstimationNode(Node):
         # heuristic picks the cable instead of the SC port at typical
         # wrist-camera working distance.
         self._external_masks: dict[int, tuple[int, np.ndarray]] = {}  # obj_id → (stamp_ns, mask)
-        # 30 s freshness window — matches register_per_frame=true budget
-        # where each frame can take ~18 s (rotation grid + register).
-        # The feeder always publishes mask + rgb with identical stamps,
-        # so any cached mask <30 s old is from a recent enough frame.
-        self._external_mask_max_age_ns = int(30.0 * 1e9)
+        # HUNK 20 (Agent Z): externally-tunable freshness window. Historic
+        # value was 30s (matched register_per_frame=true budget of ~18s
+        # per frame). Live-chain default flipped to 200ms so the legacy
+        # cached path (when mask_in_sync is False or disabled by
+        # multi-mesh) skips frames where SAM lags RGB rather than
+        # processing on a stale mask. Live mask_in_sync=true bypasses
+        # this entirely via ApproximateTimeSynchronizer.
+        self._external_mask_max_age_ns = int(
+            float(self.get_parameter('external_mask_max_age_ms').value) * 1e6
+        )
+        self._n_synced_frames = 0
+        self._n_skipped_stale_mask = 0
+        self._n_skipped_no_mask = 0
         self.cam_K = None  # Initialize cam_K as None until we receive the camera info
 
         # HUNK 5: track the input RGB stamp so publish_pose_stamped can echo it.
@@ -303,26 +345,82 @@ class PoseEstimationNode(Node):
         # in reset mode. Set to False after a successful pose_estimations build.
         self._needs_reregister = True
 
-        # HUNK 11: optional external mask subscriptions. The launch wires
-        # a topic per (cam, obj_id) based on pose_topic_prefix — we
-        # mirror the suffix scheme: pose_<cam>_<idx+1> ⇔
-        # mask_<cam>_<idx+1>. The mask is a binary mono8 Image; the
-        # most-recent message with stamp within
-        # ``_external_mask_max_age_ns`` is preferred over SAM2.
-        cam_from_pose_prefix = self._pose_topic_prefix.rsplit("_", 1)[-1]
-        mask_prefix = self._pose_topic_prefix.replace(
-            "/pose_", "/mask_", 1
+        # HUNK 11 / HUNK 20: external mask wiring. Two paths:
+        #
+        #   (A) mask_in_sync=True AND single mesh — RECOMMENDED for the
+        #       live NIC chain. The mask topic is the 4th leg of an
+        #       ApproximateTimeSynchronizer alongside (RGB, depth,
+        #       camera_info). The synchronizer guarantees the mask was
+        #       produced from an RGB image within ``mask_sync_slop_s``
+        #       (default 100ms) of the current frame, so SAM lag relative
+        #       to RGB no longer biases the pose. Frames where the
+        #       synchronizer can't find a fresh mask are simply not
+        #       processed (each input is queued for ``sync_queue`` frames).
+        #
+        #   (B) Legacy cached path — mask_in_sync=False OR multi-mesh.
+        #       The mask topic is a bare subscription; each callback caches
+        #       the latest (stamp, mask) and process_images() consumes it
+        #       via _external_masks lookup with a configurable max-age cap
+        #       (``external_mask_max_age_ms``, default 200ms).
+        #
+        # Topic naming: ``mask_topic`` param overrides; otherwise we
+        # derive from ``pose_topic_prefix`` via the legacy
+        # s/pose_/mask_/ + ``_{obj_id}`` suffix scheme.
+        mask_prefix = self._pose_topic_prefix.replace("/pose_", "/mask_", 1)
+        n_meshes = len(self.meshes)
+        self._mask_in_sync_active = (
+            self._mask_in_sync_param and n_meshes == 1
         )
-        for mesh_idx in range(len(self.meshes)):
-            obj_id = mesh_idx + 1
-            topic = f"{mask_prefix}_{obj_id}"
-            self.create_subscription(
-                Image, topic,
-                lambda m, o=obj_id: self._on_external_mask(m, o),
-                qos,
+
+        if self._mask_in_sync_active:
+            # Single-mesh path: 4-leg synchronizer.
+            obj_id = 1  # single mesh ⇒ obj_id = mesh_idx + 1 = 1
+            mask_topic = (
+                self._mask_topic_param
+                if self._mask_topic_param
+                else f"{mask_prefix}_{obj_id}"
             )
+            self.mask_mf = Subscriber(self, Image, mask_topic, qos_profile=qos)
+            # ``mask_sync_slop`` is intentionally separate from the RGB/
+            # depth/info ``slop`` — the SAM publisher emits masks
+            # asynchronously vs the RGB triplet, so we want a tighter
+            # tolerance on the mask leg.
+            self._sync = ApproximateTimeSynchronizer(
+                [self.image_mf, self.depth_mf, self.info_mf, self.mask_mf],
+                queue_size=self._sync_qlen, slop=self._mask_sync_slop,
+            )
+            self._sync.registerCallback(self._synced_callback_with_mask)
             self.get_logger().info(
-                f"HUNK 11: subscribed external mask topic {topic} → obj_id={obj_id}"
+                f"HUNK 20: mask-in-sync ENABLED. mask_topic='{mask_topic}' "
+                f"slop={self._mask_sync_slop:.3f}s queue={self._sync_qlen}"
+            )
+        else:
+            # Legacy path: 3-leg synchronizer for (RGB, depth, info)
+            # plus per-obj bare subscription for cached masks.
+            self._sync = ApproximateTimeSynchronizer(
+                [self.image_mf, self.depth_mf, self.info_mf],
+                queue_size=self._sync_qlen, slop=self._sync_slop,
+            )
+            self._sync.registerCallback(self._synced_callback)
+            for mesh_idx in range(n_meshes):
+                obj_id = mesh_idx + 1
+                topic = (
+                    self._mask_topic_param
+                    if (self._mask_topic_param and n_meshes == 1)
+                    else f"{mask_prefix}_{obj_id}"
+                )
+                self.create_subscription(
+                    Image, topic,
+                    lambda m, o=obj_id: self._on_external_mask(m, o),
+                    qos,
+                )
+                self.get_logger().info(
+                    f"HUNK 11: subscribed external mask topic {topic} → obj_id={obj_id}"
+                )
+            self.get_logger().info(
+                f"HUNK 20: mask-in-sync DISABLED "
+                f"(param={self._mask_in_sync_param} n_meshes={n_meshes}); "
+                f"using cached path with max_age={self._external_mask_max_age_ns/1e6:.0f}ms"
             )
 
         # HUNK 17 (Agent R, 2026-05-18): per-frame coarse-pose seed.
@@ -447,6 +545,57 @@ class PoseEstimationNode(Node):
         self.image_callback(img_msg)
         self.depth_callback(depth_msg)
 
+    def _synced_callback_with_mask(self, img_msg, depth_msg, info_msg, mask_msg):
+        """HUNK 20 (Agent Z, 2026-05-18): 4-leg synced entry point.
+
+        The mask is decoded and inserted into ``_external_masks`` with the
+        mask msg's own stamp — close (within ``mask_sync_slop_s``) to the
+        RGB stamp by construction of the synchronizer. ``process_images``
+        then picks it up via the same legacy code path; the freshness gate
+        there will pass trivially because we just inserted a fresh stamp.
+
+        Counts ``self._n_synced_frames`` for end-of-run reporting. The
+        ``ApproximateTimeSynchronizer`` already implicitly drops frames
+        where no fresh mask is queued — so the gap between input RGB
+        callback count and this counter is the "skipped" frame count.
+        """
+        self._last_rgb_stamp = img_msg.header.stamp
+        # Decode mask first so it's cached before process_images() runs.
+        try:
+            mask_np = self.bridge.imgmsg_to_cv2(mask_msg, desired_encoding="mono8")
+        except Exception as e:
+            self.get_logger().warn(
+                f"HUNK 20: synced mask decode failed: {e}; falling back to "
+                f"SAM2 for this frame."
+            )
+            mask_np = None
+        if mask_np is not None:
+            mask_stamp_ns = (
+                int(mask_msg.header.stamp.sec) * 10**9
+                + int(mask_msg.header.stamp.nanosec)
+            )
+            self._external_masks[1] = (
+                mask_stamp_ns, (mask_np > 0).astype(np.uint8) * 255,
+            )
+            self._n_synced_frames += 1
+            if self._n_synced_frames == 1:
+                rgb_ns = (
+                    int(img_msg.header.stamp.sec) * 10**9
+                    + int(img_msg.header.stamp.nanosec)
+                )
+                self.get_logger().info(
+                    f"HUNK 20: first 4-leg synced triple — rgb_stamp_ns={rgb_ns} "
+                    f"mask_stamp_ns={mask_stamp_ns} "
+                    f"delta_ms={(rgb_ns-mask_stamp_ns)/1e6:.1f}"
+                )
+            elif (self._n_synced_frames % 20) == 0:
+                self.get_logger().info(
+                    f"HUNK 20: n_synced={self._n_synced_frames}"
+                )
+        self.camera_info_callback(info_msg)
+        self.image_callback(img_msg)
+        self.depth_callback(depth_msg)
+
     def camera_info_callback(self, msg):
         if self.cam_K is None:  # Update cam_K only once to avoid redundant updates
             self.cam_K = np.array(msg.k).reshape((3, 3))
@@ -525,9 +674,27 @@ class PoseEstimationNode(Node):
                 obj_id = mesh_idx + 1
                 cached = self._external_masks.get(obj_id)
                 if cached is None:
+                    # HUNK 20 (Agent Z): track when we have no mask at all.
+                    if not self._mask_in_sync_active:
+                        self._n_skipped_no_mask += 1
                     continue
                 stamp_ns, mask = cached
                 if now_ns > 0 and abs(now_ns - stamp_ns) > self._external_mask_max_age_ns:
+                    # HUNK 20 (Agent Z): instrument stale-mask skips so we
+                    # can see the temporal-mismatch failure rate without
+                    # ssh-ing into the daemon. Only counted in the legacy
+                    # path; mask_in_sync drops stale frames implicitly via
+                    # the synchronizer.
+                    if not self._mask_in_sync_active:
+                        self._n_skipped_stale_mask += 1
+                        if (self._n_skipped_stale_mask % 10) == 1:
+                            self.get_logger().warn(
+                                f"HUNK 20: skipping frame — cached mask stale "
+                                f"({(now_ns - stamp_ns)/1e6:.0f}ms vs cap "
+                                f"{self._external_mask_max_age_ns/1e6:.0f}ms) "
+                                f"obj_id={obj_id} "
+                                f"(n_skipped_stale={self._n_skipped_stale_mask})"
+                            )
                     continue
                 # Resize to match color image if shapes differ.
                 if mask.shape[:2] != (H, W):
@@ -541,6 +708,18 @@ class PoseEstimationNode(Node):
                     f"HUNK 11: using external masks for "
                     f"{sorted(external_assigned.keys())}"
                 )
+            elif self._mask_in_sync_active:
+                # HUNK 20 (Agent Z): in synced mode we expect every triggered
+                # frame to carry a fresh external mask by construction. If
+                # we land here, something violated the assumption (e.g.
+                # multi-mesh path that the param-gate was supposed to
+                # exclude). Bail explicitly rather than silently fall back
+                # to SAM2.
+                self.get_logger().warn(
+                    "HUNK 20: mask_in_sync active but external_assigned empty; "
+                    "skipping frame (do NOT cold-start SAM2 in sync mode)."
+                )
+                return
             else:
                 res = self.seg_model.predict(color, verbose=False)[0]
                 if not res or len(res) == 0:
