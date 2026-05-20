@@ -17,6 +17,10 @@ import argparse
 import os
 import threading
 import time
+import tf2_ros
+from tf2_ros import TransformException
+from rclpy.time import Time as _RclpyTime
+from typing import Optional
 from scipy.spatial.transform import Rotation as R
 from ultralytics import SAM
 from cam_2_base_transform import *
@@ -200,6 +204,14 @@ class PoseEstimationNode(Node):
         self.declare_parameter('pose_mode', 'register')
         self.declare_parameter('seed_topic', '/aic_vision/coarse_pose_seed')
         self.declare_parameter('seed_max_age_ms', 500.0)
+        # HUNK 21 (2026-05-19): world-frame seed. The daemon publishes
+        # T_world_obj in ``base_frame``; this node composes
+        # ``T_cam_obj = inv(T_world_cam(rgb_stamp)) @ T_world_obj`` at
+        # the synced RGB frame's stamp via the TF buffer, eliminating
+        # the wrist-motion bias that the prior per-cam composition
+        # introduced (daemon's "latest" TF was at a different sim-time
+        # than the FP frame, biasing the seeded_track prior).
+        self.declare_parameter('base_frame', 'base_link')
 
         # HUNK 20 (Agent Z, 2026-05-18): mask-in-sync mode. When enabled and
         # the daemon is configured for a single mesh (single obj_id), the
@@ -238,6 +250,7 @@ class PoseEstimationNode(Node):
         self._pose_mode         = str(self.get_parameter('pose_mode').value).strip().lower()
         self._seed_topic        = str(self.get_parameter('seed_topic').value)
         self._seed_max_age_ns   = int(float(self.get_parameter('seed_max_age_ms').value) * 1e6)
+        self._base_frame        = str(self.get_parameter('base_frame').value)
         slop = float(self.get_parameter('sync_slop_s').value)
         qlen = int(self.get_parameter('sync_queue').value)
         self._mask_in_sync_param = bool(self.get_parameter('mask_in_sync').value)
@@ -424,15 +437,25 @@ class PoseEstimationNode(Node):
                 f"using cached path with max_age={self._external_mask_max_age_ns/1e6:.0f}ms"
             )
 
-        # HUNK 17 (Agent R, 2026-05-18): per-frame coarse-pose seed.
-        # PoseStamped with frame_id == "<cam>_camera/optical"; we only
-        # honour seeds whose frame_id matches this node's frame_id_prefix
-        # (so left/center/right FP nodes can co-exist when each subscribes
-        # to the broadcast seed topic). Seed QoS mirrors Agent Q's
-        # publisher (RELIABLE + TRANSIENT_LOCAL — latched).
-        self._latest_seed_T_cam_obj: dict[int, tuple[int, np.ndarray, int]] = {}
+        # HUNK 21 (2026-05-19): coarse-pose seed in world frame. The daemon
+        # publishes ``T_world_obj`` as a PoseStamped with
+        # ``header.frame_id == base_frame`` (e.g. "base_link"). This node
+        # composes ``T_cam_obj = inv(T_world_cam(rgb_stamp)) @ T_world_obj``
+        # at the synced RGB frame's stamp using its own TF buffer, so the
+        # prior is temporally aligned with the FP frame regardless of how
+        # out-of-phase the daemon's publish tick is. Seed QoS matches the
+        # daemon publisher (RELIABLE + TRANSIENT_LOCAL).
+        #
+        # Supersedes HUNK 17's per-cam ``<cam>_camera/optical`` seeds:
+        # those required the daemon to perform composition at its own
+        # tick using ``Time()`` (latest TF), which under bag-replay drove
+        # a ~20mm wrist-motion bias into the seeded_track prior.
+        self._latest_seed_T_world_obj: Optional[np.ndarray] = None
+        self._seed_receipt_ns: int = 0
         self._seed_lock = threading.Lock()
         if self._pose_mode == 'seeded_track':
+            self._tf_buffer = tf2_ros.Buffer()
+            self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
             seed_qos = QoSProfile(
                 reliability=ReliabilityPolicy.RELIABLE,
                 durability=DurabilityPolicy.TRANSIENT_LOCAL,
@@ -444,22 +467,22 @@ class PoseEstimationNode(Node):
                 self._on_pose_seed, seed_qos,
             )
             self.get_logger().info(
-                f"HUNK 17: subscribed seed topic {self._seed_topic} "
-                f"(only frame_id starting with '{self._frame_id_prefix}' accepted)"
+                f"HUNK 21: subscribed seed topic {self._seed_topic} "
+                f"(world-frame seeds in '{self._base_frame}' composed at "
+                f"'{self._frame_id_prefix}' via TF)"
             )
 
     def _on_pose_seed(self, msg):
-        """HUNK 17 (Agent R): cache the latest coarse-pose seed for this
-        camera. The seed is published in ``<seed_cam>_camera/optical`` by
-        the NIC pose daemon; only seeds whose ``header.frame_id`` matches
-        this node's ``frame_id_prefix`` are accepted. obj_id is inferred
-        from the topic suffix scheme: the daemon broadcasts a single
-        per-object seed today (NIC = obj_id 1), so we route it through
-        the single mesh slot we know about.
+        """HUNK 21 (2026-05-19): cache the latest world-frame coarse-pose
+        seed. The daemon publishes ``T_world_obj`` once per tick; this node
+        defers composition into ``T_cam_obj`` to the synced RGB callback
+        where ``_last_rgb_stamp`` is available, so the TF lookup matches
+        the frame FP is about to process.
         """
-        if not msg.header.frame_id.startswith(self._frame_id_prefix):
+        if msg.header.frame_id and msg.header.frame_id != self._base_frame:
+            # Defensive: reject anything that isn't in our base frame.
+            # (The daemon always publishes in base_frame after HUNK 21.)
             return
-        # Decode 4x4 T_cam_obj from PoseStamped (metres).
         px = float(msg.pose.position.x)
         py = float(msg.pose.position.y)
         pz = float(msg.pose.position.z)
@@ -471,41 +494,81 @@ class PoseEstimationNode(Node):
             Rm = R.from_quat([qx, qy, qz, qw]).as_matrix()
         except Exception:
             return
-        T = np.eye(4, dtype=np.float32)
-        T[:3, :3] = Rm.astype(np.float32)
-        T[:3, 3] = (px, py, pz)
-        stamp_ns = int(msg.header.stamp.sec) * 10**9 + int(msg.header.stamp.nanosec)
+        T_wo = np.eye(4, dtype=np.float32)
+        T_wo[:3, :3] = Rm.astype(np.float32)
+        T_wo[:3, 3] = (px, py, pz)
         receipt_ns = time.monotonic_ns()
-        # The seed is currently emitted only for NIC obj_id=1; if/when the
-        # daemon emits per-obj seeds, encode the obj_id in the topic suffix.
-        target_obj = 1
         with self._seed_lock:
-            self._latest_seed_T_cam_obj[target_obj] = (stamp_ns, T, receipt_ns)
+            self._latest_seed_T_world_obj = T_wo
+            self._seed_receipt_ns = receipt_ns
         if not getattr(self, "_seed_first_logged", False):
             self.get_logger().info(
-                f"HUNK 17: first seed received frame_id='{msg.header.frame_id}' "
-                f"t_cam_obj=({px:.3f}, {py:.3f}, {pz:.3f}) stamp_ns={stamp_ns}"
+                f"HUNK 21: first world-frame seed received frame_id='{msg.header.frame_id}' "
+                f"t_world_obj=({px:.3f}, {py:.3f}, {pz:.3f})"
             )
             self._seed_first_logged = True
 
     def _fresh_seed_T_cam_obj(self, obj_id: int):
-        """Return (T_cam_obj, age_ns) for the latest seed of obj_id,
-        or None if no seed is fresh (or none has ever arrived).
+        """Return ``(T_cam_obj, age_ns)`` composed at the synced RGB frame
+        stamp, or None if no seed is fresh / TF is unavailable.
 
-        HUNK 17 follow-up (2026-05-19): age is measured from local receipt
-        time, not the ROS stamp. In bag replay FP runs with use_sim_time=true
-        while nic_pose_daemon emits wall-stamped seeds, so comparing ROS clock
-        domains rejects valid live seeds as stale.
+        HUNK 21 (2026-05-19): the world seed is composed just-in-time using
+        the TF tree at ``_last_rgb_stamp`` (the synchronized RGB image's
+        header stamp). This eliminates the daemon-tick vs FP-frame
+        wrist-motion lag that biased the prior under bag replay.
+
+        Age is measured from local receipt time (monotonic_ns) so we don't
+        compare ROS clock domains when use_sim_time differs between the
+        daemon and this node.
         """
         with self._seed_lock:
-            entry = self._latest_seed_T_cam_obj.get(obj_id)
-        if entry is None:
+            T_wo = self._latest_seed_T_world_obj
+            receipt_ns = self._seed_receipt_ns
+        if T_wo is None:
+            self.get_logger().warn(
+                "HUNK 21 fallthrough: no world seed cached",
+                throttle_duration_sec=2.0,
+            )
             return None
-        stamp_ns, T, receipt_ns = entry
         age = time.monotonic_ns() - receipt_ns
         if age > self._seed_max_age_ns:
+            self.get_logger().warn(
+                f"HUNK 21 fallthrough: seed stale age={age/1e6:.0f}ms "
+                f"> max={self._seed_max_age_ns/1e6:.0f}ms",
+                throttle_duration_sec=2.0,
+            )
             return None
-        return T, age
+        if self._last_rgb_stamp is None:
+            self.get_logger().warn(
+                "HUNK 21 fallthrough: no RGB stamp yet",
+                throttle_duration_sec=2.0,
+            )
+            return None
+        # Compose T_cam_obj = inv(T_world_cam(rgb_stamp)) @ T_world_obj.
+        try:
+            tfs = self._tf_buffer.lookup_transform(
+                self._frame_id_prefix,   # cam optical frame
+                self._base_frame,        # world / base_link
+                _RclpyTime.from_msg(self._last_rgb_stamp),
+            )
+        except TransformException as e:
+            self.get_logger().warn(
+                f"HUNK 21 fallthrough: TF lookup failed "
+                f"'{self._frame_id_prefix}'<-'{self._base_frame}'@{self._last_rgb_stamp.sec}.{self._last_rgb_stamp.nanosec}: {e}",
+                throttle_duration_sec=2.0,
+            )
+            return None
+        t = tfs.transform.translation
+        q = tfs.transform.rotation
+        try:
+            Rcw_mat = R.from_quat([q.x, q.y, q.z, q.w]).as_matrix()
+        except Exception:
+            return None
+        T_cw = np.eye(4, dtype=np.float32)
+        T_cw[:3, :3] = Rcw_mat.astype(np.float32)
+        T_cw[:3, 3] = (float(t.x), float(t.y), float(t.z))
+        T_co = (T_cw @ T_wo).astype(np.float32)
+        return T_co, age
 
     def _on_external_mask(self, msg, obj_id: int):
         """HUNK 11: cache the latest external mask for this obj_id."""
@@ -795,8 +858,23 @@ class PoseEstimationNode(Node):
             # pattern that reaches 3.88mm. Falls through to register
             # when no fresh seed is in cache.
             seeded = None
+            seed_pending_tf = False
             if self._pose_mode == 'seeded_track' and _HAVE_TORCH:
                 seeded = self._fresh_seed_T_cam_obj(obj_id_local)
+                # HUNK 21 (2026-05-19): if a world seed is cached but
+                # composition failed (TF not yet covering this RGB stamp),
+                # skip this frame rather than fall through to register(),
+                # which OOMs at 252-candidate hypothesis search on 20 GB
+                # GPUs. The TF buffer fills as bag-replay progresses;
+                # the next frame whose stamp is within /tf coverage
+                # succeeds. Skipping a few early frames is preferable
+                # to an OOM cascade.
+                if seeded is None and self._latest_seed_T_world_obj is not None:
+                    seed_pending_tf = True
+            if seed_pending_tf:
+                # Don't run register() — daemon will eventually publish a
+                # seed whose composition succeeds.
+                continue
             if seeded is not None:
                 seed_T, seed_age_ns = seeded
                 # HUNK 18 (Agent S, 2026-05-18): convert seed_T from the
