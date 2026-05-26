@@ -803,7 +803,16 @@ class PoseEstimationNode(Node):
     def camera_info_callback(self, msg):
         if self.cam_K is None:  # Update cam_K only once to avoid redundant updates
             self.cam_K = np.array(msg.k).reshape((3, 3))
-            self.get_logger().info(f"Camera intrinsic matrix initialized: {self.cam_K}")
+            # Record the resolution this K is FOR. The AIC Gazebo wrist cameras
+            # publish camera_info at the sensor's native 576x512 (fx~618), but
+            # the /image topic is rescaled to 1152x1024 (fx~1236.6) — so K must
+            # be scaled to the image resolution before use. Done once, in
+            # process_images, where the actual image W is known.
+            self._cam_info_w = int(getattr(msg, "width", 0)) or None
+            self._cam_info_h = int(getattr(msg, "height", 0)) or None
+            self.get_logger().info(
+                f"Camera intrinsic matrix initialized (for {self._cam_info_w}x{self._cam_info_h}): {self.cam_K}"
+            )
 
     def image_callback(self, msg):
         self.color_image = self.bridge.imgmsg_to_cv2(msg, "rgb8")
@@ -847,6 +856,24 @@ class PoseEstimationNode(Node):
             return
 
         H, W = self.color_image.shape[:2]
+        # K-RESOLUTION FIX: the cached camera_info K may be for a different
+        # resolution than the actual image (AIC eval publishes camera_info at
+        # native 576x512 / fx~618 but the image at 1152x1024 / fx~1236.6).
+        # Using the wrong-scale K makes FP.register's depth back-projection ~2x
+        # off → add_errs=-1 → no valid pose → fp_msgs=0 (and it's racy: whichever
+        # K arrived first was cached). Scale K to the image resolution ONCE
+        # (idempotent), loudly. See MEMORY "K-resolution mismatch" tripwire.
+        _ciw = getattr(self, "_cam_info_w", None)
+        if _ciw and W != _ciw and self.cam_K is not None:
+            _s = float(W) / float(_ciw)
+            self.cam_K = self.cam_K.astype(float).copy()
+            self.cam_K[0, 0] *= _s; self.cam_K[1, 1] *= _s
+            self.cam_K[0, 2] *= _s; self.cam_K[1, 2] *= _s
+            self.get_logger().warning(
+                f"K-resolution fix: scaled cam_K x{_s:.3f} (camera_info {_ciw}px -> "
+                f"image {W}px); fx={self.cam_K[0, 0]:.1f} cx={self.cam_K[0, 2]:.1f}"
+            )
+            self._cam_info_w = W  # idempotent: K now matches image resolution
         color = cv2.resize(self.color_image, (W, H), interpolation=cv2.INTER_NEAREST)
         depth = cv2.resize(self.depth_image, (W, H), interpolation=cv2.INTER_NEAREST)
         # HUNK 12 (Phase 1.G parity): the upstream daemon clamped
