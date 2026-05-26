@@ -267,7 +267,7 @@ class PoseEstimationNode(Node):
         event_sync_queue         = int(self.get_parameter('event_sync_queue').value)
 
         if self._pose_mode not in ('register', 'seeded_track', 'track'):
-            self.get_logger().warn(
+            self.get_logger().warning(
                 f"HUNK 17: unknown pose_mode='{self._pose_mode}'; falling back to 'register'"
             )
             self._pose_mode = 'register'
@@ -543,21 +543,21 @@ class PoseEstimationNode(Node):
             T_wo = self._latest_seed_T_world_obj
             receipt_ns = self._seed_receipt_ns
         if T_wo is None:
-            self.get_logger().warn(
+            self.get_logger().warning(
                 "HUNK 21 fallthrough: no world seed cached",
                 throttle_duration_sec=2.0,
             )
             return None
         age = time.monotonic_ns() - receipt_ns
         if age > self._seed_max_age_ns:
-            self.get_logger().warn(
+            self.get_logger().warning(
                 f"HUNK 21 fallthrough: seed stale age={age/1e6:.0f}ms "
                 f"> max={self._seed_max_age_ns/1e6:.0f}ms",
                 throttle_duration_sec=2.0,
             )
             return None
         if self._last_rgb_stamp is None:
-            self.get_logger().warn(
+            self.get_logger().warning(
                 "HUNK 21 fallthrough: no RGB stamp yet",
                 throttle_duration_sec=2.0,
             )
@@ -570,7 +570,7 @@ class PoseEstimationNode(Node):
                 _RclpyTime.from_msg(self._last_rgb_stamp),
             )
         except TransformException as e:
-            self.get_logger().warn(
+            self.get_logger().warning(
                 f"HUNK 21 fallthrough: TF lookup failed "
                 f"'{self._frame_id_prefix}'<-'{self._base_frame}'@{self._last_rgb_stamp.sec}.{self._last_rgb_stamp.nanosec}: {e}",
                 throttle_duration_sec=2.0,
@@ -593,7 +593,7 @@ class PoseEstimationNode(Node):
         try:
             mask = self.bridge.imgmsg_to_cv2(msg, desired_encoding="mono8")
         except Exception as e:
-            self.get_logger().warn(
+            self.get_logger().warning(
                 f"HUNK 11: external mask decode failed for obj_id={obj_id}: {e}"
             )
             return
@@ -660,7 +660,7 @@ class PoseEstimationNode(Node):
         if self._event_info_msg is None or self.cam_K is None:
             self._event_n_no_info += 1
             if self._event_n_no_info == 1 or self._event_n_no_info % 10 == 0:
-                self.get_logger().warn(
+                self.get_logger().warning(
                     f"HUNK 22: event-sync has {source} stamp={stamp_ns} but no "
                     f"CameraInfo/K yet (n_no_info={self._event_n_no_info})"
                 )
@@ -680,7 +680,7 @@ class PoseEstimationNode(Node):
                     nearest_ms = depth_delta_ns / 1e6
                 if mask_msg is None and mask_delta_ns is not None:
                     nearest_ms = mask_delta_ns / 1e6
-                self.get_logger().warn(
+                self.get_logger().warning(
                     f"HUNK 22: event-sync no depth/mask pair for {source} "
                     f"stamp={stamp_ns}; tol_ms={self._event_sync_tol_ns/1e6:.1f} "
                     f"nearest_delta_ms={nearest_ms} "
@@ -701,7 +701,7 @@ class PoseEstimationNode(Node):
                 "None" if rgb_delta_ns is None
                 else f"{rgb_delta_ns/1e6:.1f}"
             )
-            self.get_logger().warn(
+            self.get_logger().warning(
                 f"HUNK 22: event-sync no matching RGB for stamp={depth_ns}; "
                 f"source={source} mask_delta_ms={abs(mask_ns-depth_ns)/1e6:.1f} "
                 f"nearest_rgb_delta_ms={nearest_rgb_delta_ms} "
@@ -768,7 +768,7 @@ class PoseEstimationNode(Node):
         try:
             mask_np = self.bridge.imgmsg_to_cv2(mask_msg, desired_encoding="mono8")
         except Exception as e:
-            self.get_logger().warn(
+            self.get_logger().warning(
                 f"HUNK 20: synced mask decode failed: {e}; falling back to "
                 f"SAM2 for this frame."
             )
@@ -825,7 +825,7 @@ class PoseEstimationNode(Node):
             depth_m = raw.astype(np.float32) / 1000.0
             scale = 1.0 / 1000.0
         else:
-            self.get_logger().warn(
+            self.get_logger().warning(
                 f"HUNK 7: unrecognized depth encoding '{enc}'; assuming metres (1.0 scale)."
             )
             depth_m = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough').astype(np.float32)
@@ -892,7 +892,7 @@ class PoseEstimationNode(Node):
                     if not self._mask_in_sync_active:
                         self._n_skipped_stale_mask += 1
                         if (self._n_skipped_stale_mask % 10) == 1:
-                            self.get_logger().warn(
+                            self.get_logger().warning(
                                 f"HUNK 20: skipping frame — cached mask stale "
                                 f"({(now_ns - stamp_ns)/1e6:.0f}ms vs cap "
                                 f"{self._external_mask_max_age_ns/1e6:.0f}ms) "
@@ -919,7 +919,7 @@ class PoseEstimationNode(Node):
                 # multi-mesh path that the param-gate was supposed to
                 # exclude). Bail explicitly rather than silently fall back
                 # to SAM2.
-                self.get_logger().warn(
+                self.get_logger().warning(
                     "HUNK 20: mask_in_sync active but external_assigned empty; "
                     "skipping frame (do NOT cold-start SAM2 in sync mode)."
                 )
@@ -927,7 +927,7 @@ class PoseEstimationNode(Node):
             else:
                 res = self.seg_model.predict(color, verbose=False)[0]
                 if not res or len(res) == 0:
-                    self.get_logger().warn("HUNK 3: SAM2 produced no masks; retry next frame.")
+                    self.get_logger().warning("HUNK 3: SAM2 produced no masks; retry next frame.")
                     return
 
                 objects_to_track = []
@@ -945,7 +945,7 @@ class PoseEstimationNode(Node):
                         })
 
                 if not objects_to_track:
-                    self.get_logger().warn("HUNK 3: no usable mask candidates; retry next frame.")
+                    self.get_logger().warning("HUNK 3: no usable mask candidates; retry next frame.")
                     return
 
                 assigned = self._assign_masks_to_meshes(objects_to_track, color)
@@ -980,7 +980,7 @@ class PoseEstimationNode(Node):
             if not temporary_pose_estimations:
                 # No mesh was assigned a usable mask. Leave _needs_reregister
                 # TRUE so the next frame retries. Do NOT advance _frame_count.
-                self.get_logger().warn(
+                self.get_logger().warning(
                     "HUNK 3: assignment yielded zero pose estimators; retry next frame."
                 )
                 return
@@ -1145,7 +1145,7 @@ class PoseEstimationNode(Node):
             try:
                 return self._assign_by_gt_iou(candidates)
             except Exception as e:
-                self.get_logger().warn(
+                self.get_logger().warning(
                     f"HUNK 3: gt_bbox_iou unavailable ({e}); falling back to class_filter."
                 )
                 return self._assign_by_class(candidates)
@@ -1183,7 +1183,7 @@ class PoseEstimationNode(Node):
             return vis
         except Exception as e:
             if not getattr(self, "_viz_warned", False):
-                self.get_logger().warn(f"visualize_pose disabled (cv2 type-check): {e}")
+                self.get_logger().warning(f"visualize_pose disabled (cv2 type-check): {e}")
                 self._viz_warned = True
             return image
 
