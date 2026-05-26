@@ -21,6 +21,7 @@ import tf2_ros
 from tf2_ros import TransformException
 from rclpy.time import Time as _RclpyTime
 from typing import Optional
+from collections import OrderedDict
 from scipy.spatial.transform import Rotation as R
 from ultralytics import SAM
 from cam_2_base_transform import *
@@ -232,6 +233,13 @@ class PoseEstimationNode(Node):
         self.declare_parameter('mask_in_sync', True)
         self.declare_parameter('mask_topic', '')
         self.declare_parameter('mask_sync_slop_s', 0.1)
+        # HUNK 22 (2026-05-26): event-keyed sync buffer for delayed derived
+        # streams. FoundationStereo depth and the downstream mask carry the
+        # SOURCE RGB stamp but arrive ~4s later, so a generic 4-leg
+        # ApproximateTimeSynchronizer can evict the matching RGB first.
+        # Buffer >=10s at 20Hz; exact/tight stamp matching still uses
+        # mask_sync_slop_s.
+        self.declare_parameter('event_sync_queue', 250)
         # Tighter fallback for the legacy cached path (only relevant when
         # mask_in_sync is False or disabled by multi-mesh): 200ms cap so
         # we skip frames where SAM lagged RGB rather than running FP on a
@@ -256,6 +264,7 @@ class PoseEstimationNode(Node):
         self._mask_in_sync_param = bool(self.get_parameter('mask_in_sync').value)
         mask_topic_param         = str(self.get_parameter('mask_topic').value).strip()
         mask_sync_slop           = float(self.get_parameter('mask_sync_slop_s').value)
+        event_sync_queue         = int(self.get_parameter('event_sync_queue').value)
 
         if self._pose_mode not in ('register', 'seeded_track', 'track'):
             self.get_logger().warn(
@@ -271,10 +280,11 @@ class PoseEstimationNode(Node):
             f"seed_max_age_ms={self._seed_max_age_ns/1e6:.0f}"
         )
 
-        # HUNK 8: ApproximateTimeSynchronizer for the (RGB, depth, camera_info)
+        # HUNK 8: synchronized entry point for the (RGB, depth, camera_info)
         # trio. Slop = 0.05 s = the PRD's timestamp_tolerance_ms (50 ms).
-        # NOTE: the previous bare `self.create_subscription` calls from upstream
-        # are intentionally removed in favor of this single synced entry-point.
+        # HUNK 22 creates subscriptions after mesh loading so the single-mesh
+        # live path can use event-keyed sync without also subscribing via
+        # message_filters.
         #
         # HUNK 16: RELIABLE QoS. ros_gz_bridge publishes the AIC eval
         # container's RGB / depth / camera_info topics with
@@ -288,16 +298,15 @@ class PoseEstimationNode(Node):
             history=HistoryPolicy.KEEP_LAST,
             depth=qlen,
         )
-        self.image_mf = Subscriber(self, Image, image_topic, qos_profile=qos)
-        self.depth_mf = Subscriber(self, Image, depth_topic, qos_profile=qos)
-        self.info_mf  = Subscriber(self, CameraInfo, info_topic, qos_profile=qos)
         # HUNK 20 (Agent Z): defer the synchronizer construction until we
         # know how many meshes were passed (mask_in_sync only kicks in
-        # for the single-mesh case). The 4-leg synchronizer is built
-        # below, after ``self.meshes`` is populated.
+        # for the single-mesh case). Subscriptions are built below, after
+        # ``self.meshes`` is populated.
         self._sync_qlen = qlen
         self._sync_slop = slop
         self._mask_sync_slop = mask_sync_slop
+        self._event_sync_qlen = max(1, event_sync_queue)
+        self._event_sync_tol_ns = int(mask_sync_slop * 1e9)
         self._mask_topic_param = mask_topic_param
         self._sync_qos = qos
 
@@ -319,13 +328,22 @@ class PoseEstimationNode(Node):
         # cached path (when mask_in_sync is False or disabled by
         # multi-mesh) skips frames where SAM lags RGB rather than
         # processing on a stale mask. Live mask_in_sync=true bypasses
-        # this entirely via ApproximateTimeSynchronizer.
+        # this entirely via the HUNK 22 event-keyed synchronizer.
         self._external_mask_max_age_ns = int(
             float(self.get_parameter('external_mask_max_age_ms').value) * 1e6
         )
         self._n_synced_frames = 0
         self._n_skipped_stale_mask = 0
         self._n_skipped_no_mask = 0
+        self._event_rgb_msgs = OrderedDict()
+        self._event_depth_msgs = OrderedDict()
+        self._event_mask_msgs = OrderedDict()
+        self._event_info_msg: Optional[CameraInfo] = None
+        self._event_n_matched = 0
+        self._event_n_no_rgb = 0
+        self._event_n_no_pair = 0
+        self._event_n_no_info = 0
+        self._event_n_info_changed = 0
         self.cam_K = None  # Initialize cam_K as None until we receive the camera info
 
         # HUNK 5: track the input RGB stamp so publish_pose_stamped can echo it.
@@ -359,17 +377,13 @@ class PoseEstimationNode(Node):
         # in reset mode. Set to False after a successful pose_estimations build.
         self._needs_reregister = True
 
-        # HUNK 11 / HUNK 20: external mask wiring. Two paths:
+        # HUNK 11 / HUNK 20 / HUNK 22: external mask wiring. Two paths:
         #
         #   (A) mask_in_sync=True AND single mesh — RECOMMENDED for the
-        #       live NIC chain. The mask topic is the 4th leg of an
-        #       ApproximateTimeSynchronizer alongside (RGB, depth,
-        #       camera_info). The synchronizer guarantees the mask was
-        #       produced from an RGB image within ``mask_sync_slop_s``
-        #       (default 100ms) of the current frame, so SAM lag relative
-        #       to RGB no longer biases the pose. Frames where the
-        #       synchronizer can't find a fresh mask are simply not
-        #       processed (each input is queued for ``sync_queue`` frames).
+        #       live NIC chain. HUNK 22 syncs by source event stamp:
+        #       RGB is cached, CameraInfo K is cached/static, and depth+mask
+        #       trigger dispatch once both source-stamped derived streams
+        #       arrive within ``mask_sync_slop_s`` (default 100ms).
         #
         #   (B) Legacy cached path — mask_in_sync=False OR multi-mesh.
         #       The mask topic is a bare subscription; each callback caches
@@ -387,30 +401,34 @@ class PoseEstimationNode(Node):
         )
 
         if self._mask_in_sync_active:
-            # Single-mesh path: 4-leg synchronizer.
+            # HUNK 22: Single-mesh live path uses an event-keyed
+            # synchronizer instead of a 4-leg ApproximateTimeSynchronizer.
+            # Depth and mask are source-stamped but arrive seconds after
+            # RGB; we cache RGB by stamp and trigger when the slow
+            # source-stamped streams have both arrived. CameraInfo is
+            # static K, so cache/validate it once instead of making it a
+            # delayed sync leg.
             obj_id = 1  # single mesh ⇒ obj_id = mesh_idx + 1 = 1
             mask_topic = (
                 self._mask_topic_param
                 if self._mask_topic_param
                 else f"{mask_prefix}_{obj_id}"
             )
-            self.mask_mf = Subscriber(self, Image, mask_topic, qos_profile=qos)
-            # ``mask_sync_slop`` is intentionally separate from the RGB/
-            # depth/info ``slop`` — the SAM publisher emits masks
-            # asynchronously vs the RGB triplet, so we want a tighter
-            # tolerance on the mask leg.
-            self._sync = ApproximateTimeSynchronizer(
-                [self.image_mf, self.depth_mf, self.info_mf, self.mask_mf],
-                queue_size=self._sync_qlen, slop=self._mask_sync_slop,
-            )
-            self._sync.registerCallback(self._synced_callback_with_mask)
+            self.create_subscription(Image, image_topic, self._event_on_rgb, qos)
+            self.create_subscription(Image, depth_topic, self._event_on_depth, qos)
+            self.create_subscription(CameraInfo, info_topic, self._event_on_info, qos)
+            self.create_subscription(Image, mask_topic, self._event_on_mask, qos)
             self.get_logger().info(
-                f"HUNK 20: mask-in-sync ENABLED. mask_topic='{mask_topic}' "
-                f"slop={self._mask_sync_slop:.3f}s queue={self._sync_qlen}"
+                f"HUNK 22: event-sync ENABLED. mask_topic='{mask_topic}' "
+                f"tol={self._mask_sync_slop:.3f}s queue={self._event_sync_qlen}; "
+                f"CameraInfo cached/static"
             )
         else:
             # Legacy path: 3-leg synchronizer for (RGB, depth, info)
             # plus per-obj bare subscription for cached masks.
+            self.image_mf = Subscriber(self, Image, image_topic, qos_profile=qos)
+            self.depth_mf = Subscriber(self, Image, depth_topic, qos_profile=qos)
+            self.info_mf = Subscriber(self, CameraInfo, info_topic, qos_profile=qos)
             self._sync = ApproximateTimeSynchronizer(
                 [self.image_mf, self.depth_mf, self.info_mf],
                 queue_size=self._sync_qlen, slop=self._sync_slop,
@@ -589,6 +607,130 @@ class PoseEstimationNode(Node):
                 f"coverage={coverage}px stamp={stamp_ns}"
             )
 
+    @staticmethod
+    def _stamp_ns(msg):
+        return int(msg.header.stamp.sec) * 10**9 + int(msg.header.stamp.nanosec)
+
+    def _event_put(self, buf, msg):
+        stamp_ns = self._stamp_ns(msg)
+        buf[stamp_ns] = msg
+        buf.move_to_end(stamp_ns)
+        while len(buf) > self._event_sync_qlen:
+            buf.popitem(last=False)
+        return stamp_ns
+
+    def _event_nearest(self, buf, stamp_ns):
+        if stamp_ns in buf:
+            return stamp_ns, buf[stamp_ns], 0
+        if not buf:
+            return None, None, None
+        best_ns = min(buf.keys(), key=lambda k: abs(k - stamp_ns))
+        delta_ns = abs(best_ns - stamp_ns)
+        if delta_ns <= self._event_sync_tol_ns:
+            return best_ns, buf[best_ns], delta_ns
+        return None, None, delta_ns
+
+    def _event_on_rgb(self, msg):
+        self._event_put(self._event_rgb_msgs, msg)
+
+    def _event_on_info(self, msg):
+        K = np.array(msg.k).reshape((3, 3))
+        if self.cam_K is None:
+            self._event_info_msg = msg
+            self.camera_info_callback(msg)
+            return
+        if not np.allclose(K, self.cam_K, rtol=0.0, atol=1e-6):
+            self._event_n_info_changed += 1
+            self.get_logger().error(
+                f"HUNK 22: event-sync CameraInfo K changed; keeping initial K "
+                f"(n_changed={self._event_n_info_changed}). old={self.cam_K} new={K}"
+            )
+            return
+        self._event_info_msg = msg
+
+    def _event_on_depth(self, msg):
+        stamp_ns = self._event_put(self._event_depth_msgs, msg)
+        self._event_try_dispatch(stamp_ns, "depth")
+
+    def _event_on_mask(self, msg):
+        stamp_ns = self._event_put(self._event_mask_msgs, msg)
+        self._event_try_dispatch(stamp_ns, "mask")
+
+    def _event_try_dispatch(self, stamp_ns, source):
+        if self._event_info_msg is None or self.cam_K is None:
+            self._event_n_no_info += 1
+            if self._event_n_no_info == 1 or self._event_n_no_info % 10 == 0:
+                self.get_logger().warn(
+                    f"HUNK 22: event-sync has {source} stamp={stamp_ns} but no "
+                    f"CameraInfo/K yet (n_no_info={self._event_n_no_info})"
+                )
+            return
+
+        depth_ns, depth_msg, depth_delta_ns = self._event_nearest(
+            self._event_depth_msgs, stamp_ns
+        )
+        mask_ns, mask_msg, mask_delta_ns = self._event_nearest(
+            self._event_mask_msgs, stamp_ns
+        )
+        if depth_msg is None or mask_msg is None:
+            self._event_n_no_pair += 1
+            if self._event_n_no_pair == 1 or self._event_n_no_pair % 10 == 0:
+                nearest_ms = None
+                if depth_msg is None and depth_delta_ns is not None:
+                    nearest_ms = depth_delta_ns / 1e6
+                if mask_msg is None and mask_delta_ns is not None:
+                    nearest_ms = mask_delta_ns / 1e6
+                self.get_logger().warn(
+                    f"HUNK 22: event-sync no depth/mask pair for {source} "
+                    f"stamp={stamp_ns}; tol_ms={self._event_sync_tol_ns/1e6:.1f} "
+                    f"nearest_delta_ms={nearest_ms} "
+                    f"buffers rgb={len(self._event_rgb_msgs)} "
+                    f"depth={len(self._event_depth_msgs)} mask={len(self._event_mask_msgs)} "
+                    f"(n_no_pair={self._event_n_no_pair})"
+                )
+            return
+
+        # Prefer the depth source stamp as the canonical frame stamp; the
+        # mask publisher should propagate the same RGB stamp.
+        rgb_ns, rgb_msg, rgb_delta_ns = self._event_nearest(
+            self._event_rgb_msgs, depth_ns
+        )
+        if rgb_msg is None:
+            self._event_n_no_rgb += 1
+            nearest_rgb_delta_ms = (
+                "None" if rgb_delta_ns is None
+                else f"{rgb_delta_ns/1e6:.1f}"
+            )
+            self.get_logger().warn(
+                f"HUNK 22: event-sync no matching RGB for stamp={depth_ns}; "
+                f"source={source} mask_delta_ms={abs(mask_ns-depth_ns)/1e6:.1f} "
+                f"nearest_rgb_delta_ms={nearest_rgb_delta_ms} "
+                f"buffers rgb={len(self._event_rgb_msgs)} "
+                f"depth={len(self._event_depth_msgs)} mask={len(self._event_mask_msgs)} "
+                f"queue={self._event_sync_qlen} tol_ms={self._event_sync_tol_ns/1e6:.1f} "
+                f"(n_no_rgb={self._event_n_no_rgb})"
+            )
+            return
+
+        self._event_depth_msgs.pop(depth_ns, None)
+        self._event_mask_msgs.pop(mask_ns, None)
+        self._event_rgb_msgs.pop(rgb_ns, None)
+        self._event_n_matched += 1
+        now_ns = self.get_clock().now().nanoseconds
+        depth_lag_s = (now_ns - depth_ns) / 1e9 if now_ns > depth_ns else 0.0
+        if self._event_n_matched == 1 or self._event_n_matched % 20 == 0:
+            self.get_logger().info(
+                f"HUNK 22 event-sync: matched (rgb,depth,mask) at stamp={depth_ns} "
+                f"depth_lag={depth_lag_s:.3f}s "
+                f"rgb_delta_ms={abs(rgb_ns-depth_ns)/1e6:.1f} "
+                f"mask_delta_ms={abs(mask_ns-depth_ns)/1e6:.1f} "
+                f"(n={self._event_n_matched})"
+            )
+
+        self._synced_callback_with_mask(
+            rgb_msg, depth_msg, self._event_info_msg, mask_msg
+        )
+
     def _synced_callback(self, img_msg, depth_msg, info_msg):
         """HUNK 8: single entry point for the synced (RGB, depth, info) triple.
 
@@ -606,18 +748,20 @@ class PoseEstimationNode(Node):
         self.depth_callback(depth_msg)
 
     def _synced_callback_with_mask(self, img_msg, depth_msg, info_msg, mask_msg):
-        """HUNK 20 (Agent Z, 2026-05-18): 4-leg synced entry point.
+        """HUNK 20/22: synced entry point for RGB, depth, CameraInfo, mask.
 
         The mask is decoded and inserted into ``_external_masks`` with the
         mask msg's own stamp — close (within ``mask_sync_slop_s``) to the
-        RGB stamp by construction of the synchronizer. ``process_images``
-        then picks it up via the same legacy code path; the freshness gate
-        there will pass trivially because we just inserted a fresh stamp.
+        RGB stamp by construction of the synchronizer. HUNK 22's live path
+        reaches this via the event-keyed synchronizer; the legacy wording
+        still applies to older 4-leg ApproximateTimeSynchronizer callers.
+        ``process_images`` then picks it up via the same legacy code path;
+        the freshness gate there will pass trivially because we just inserted
+        a fresh stamp.
 
-        Counts ``self._n_synced_frames`` for end-of-run reporting. The
-        ``ApproximateTimeSynchronizer`` already implicitly drops frames
-        where no fresh mask is queued — so the gap between input RGB
-        callback count and this counter is the "skipped" frame count.
+        Counts ``self._n_synced_frames`` for end-of-run reporting. HUNK 22
+        logs no-match cases explicitly before skipping a frame; older
+        ApproximateTimeSynchronizer callers implicitly dropped them.
         """
         self._last_rgb_stamp = img_msg.header.stamp
         # Decode mask first so it's cached before process_images() runs.
@@ -644,13 +788,13 @@ class PoseEstimationNode(Node):
                     + int(img_msg.header.stamp.nanosec)
                 )
                 self.get_logger().info(
-                    f"HUNK 20: first 4-leg synced triple — rgb_stamp_ns={rgb_ns} "
+                    f"HUNK 20/22: first synced mask frame rgb_stamp_ns={rgb_ns} "
                     f"mask_stamp_ns={mask_stamp_ns} "
                     f"delta_ms={(rgb_ns-mask_stamp_ns)/1e6:.1f}"
                 )
             elif (self._n_synced_frames % 20) == 0:
                 self.get_logger().info(
-                    f"HUNK 20: n_synced={self._n_synced_frames}"
+                    f"HUNK 20/22: n_synced={self._n_synced_frames}"
                 )
         self.camera_info_callback(info_msg)
         self.image_callback(img_msg)

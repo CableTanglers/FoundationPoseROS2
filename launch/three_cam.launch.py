@@ -89,13 +89,12 @@ def _one_cam(cam, mesh_paths, strategy_arg, reset_arg, sim_time_arg,
             # fp_daemon_server's TF lookup needs this to match.
             '-p', f"frame_id_prefix:={cam}_camera/optical",
             '-p', 'sync_slop_s:=0.05',
-            # HUNK 20 (Agent Z, 2026-05-18): bump sync_queue from default 10
-            # to 100 so the synchronizer can absorb the FoundationStereo
-            # depth adapter's ~3s/frame inference latency without evicting
-            # in-flight RGB frames. With queue=10 and ~14 fps RGB, RGB
-            # frames are evicted within ~0.7s — well before depth catches
-            # up. queue=100 lets depth take 7s to land and still match.
+            # HUNK 20/22: sync_queue remains for the legacy 3-leg
+            # ApproximateTimeSynchronizer. The live single-mesh mask path
+            # uses event_sync_queue below so late source-stamped depth/mask
+            # streams can find their source RGB without widening sync slop.
             '-p', 'sync_queue:=100',
+            '-p', 'event_sync_queue:=250',
             '-p', ['reset_each_frame:=', reset_arg],
             # HUNK 17 (Agent R, 2026-05-18): seeded_track mode + seed
             # topic wiring. Default 'register' preserves legacy
@@ -104,12 +103,12 @@ def _one_cam(cam, mesh_paths, strategy_arg, reset_arg, sim_time_arg,
             '-p', ['pose_mode:=', pose_mode_arg],
             '-p', ['seed_topic:=', seed_topic_arg],
             '-p', ['seed_max_age_ms:=', seed_max_age_ms_arg],
-            # HUNK 20 (Agent Z, 2026-05-18): mask-in-sync wiring.
-            # When mask_in_sync=true AND argv has exactly one mesh,
-            # the daemon adds the mask topic as a 4th leg of the
-            # ApproximateTimeSynchronizer (tight 100ms slop). For the
-            # multi-mesh case the param silently degrades to the
-            # legacy cached path (controlled by external_mask_max_age_ms).
+            # HUNK 20/22: mask-in-sync wiring. When mask_in_sync=true AND
+            # argv has exactly one mesh, the daemon uses the HUNK 22
+            # event-keyed synchronizer (tight mask_sync_slop_s stamp
+            # tolerance). For the multi-mesh case the param silently
+            # degrades to the legacy cached path
+            # (controlled by external_mask_max_age_ms).
             '-p', ['mask_in_sync:=', mask_in_sync_arg],
             '-p', ['mask_sync_slop_s:=', mask_sync_slop_s_arg],
             '-p', ['external_mask_max_age_ms:=', external_mask_max_age_ms_arg],
